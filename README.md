@@ -116,10 +116,10 @@ tail -f outlook-register-service/register-results/register.log
 
 ## GoPay OTP
 
-GoPay payment 内置 OTP webhook。手机端通知转发工具把收到的 GoPay OTP POST 到：
+GoPay payment 内置 OTP webhook。手机端通知转发工具默认把收到的 GoPay OTP POST 到：
 
 ```text
-http://<本机局域网 IP>:8081/webhook/otp
+http://192.168.0.115:8081/webhook/otp
 ```
 
 仓库内置了一个专用 Android 转发器：
@@ -129,7 +129,7 @@ cd whatsapp-forwarder
 ./gradlew assembleDebug
 ```
 
-本地安装 `whatsapp-forwarder/app/build/outputs/apk/debug/app-debug.apk`，或从 GitHub Releases 下载 `whatsapp-forwarder.apk`。安装后在应用里填写上面的 webhook URL，并在系统设置中启用 `WhatsApp Forwarder` 通知访问。
+本地安装 `whatsapp-forwarder/app/build/outputs/apk/debug/app-debug.apk`，或从 GitHub Releases 下载 `whatsapp-forwarder.apk`。安装后确认 webhook URL，并在系统设置中启用 `WhatsApp Forwarder` 通知访问。
 
 本机测试：
 

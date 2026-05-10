@@ -4,48 +4,58 @@ import android.app.Notification
 import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import com.nbregister.whatsappforwarder.data.QueueRepository
+import android.util.Log
+import com.nbregister.whatsappforwarder.data.OtpExtractor
+import com.nbregister.whatsappforwarder.network.OtpWebhookClient
 import com.nbregister.whatsappforwarder.settings.SettingsStore
-import com.nbregister.whatsappforwarder.worker.WorkerScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 class WhatsAppNotificationListenerService : NotificationListenerService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val client = OtpWebhookClient()
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val item = sbn ?: return
         val settings = SettingsStore(applicationContext)
-        if (!settings.isWatchedPackage(item.packageName)) {
+        val appSettings = settings.readAll()
+        if (
+            !appSettings.forwardingEnabled ||
+            appSettings.webhookUrl.isBlank() ||
+            item.packageName !in appSettings.whatsappPackages
+        ) {
             return
         }
 
         val appName = resolveAppName(item.packageName)
-        val notificationKey = buildNotificationKey(item)
         val candidates = extractCandidates(item.notification)
         if (candidates.isEmpty()) {
             return
         }
 
         serviceScope.launch {
-            val repository = QueueRepository(applicationContext)
-            var enqueued = false
             for (candidate in candidates) {
-                enqueued = repository.enqueueCandidate(
-                    packageName = item.packageName,
-                    appName = appName,
-                    title = candidate.title,
-                    text = candidate.text,
-                    postedAt = item.postTime,
-                    notificationKey = notificationKey,
-                ) || enqueued
-            }
-            if (enqueued) {
-                WorkerScheduler.enqueueImmediate(applicationContext)
+                val otp = OtpExtractor.extractOtp(candidate.text) ?: continue
+                if (appSettings.requireKeyword && !OtpExtractor.hasKeyword(candidate.text, appSettings.keywords)) {
+                    continue
+                }
+
+                val result = client.send(appSettings.webhookUrl, otp)
+                if (result.success) {
+                    Log.i(TAG, "Forwarded WhatsApp OTP from $appName")
+                } else {
+                    Log.w(TAG, "Failed to forward WhatsApp OTP: ${result.message}")
+                }
             }
         }
+    }
+
+    override fun onDestroy() {
+        serviceScope.cancel()
+        super.onDestroy()
     }
 
     private fun resolveAppName(packageName: String): String {
@@ -93,16 +103,12 @@ class WhatsAppNotificationListenerService : NotificationListenerService() {
         return candidates.toList()
     }
 
-    private fun buildNotificationKey(sbn: StatusBarNotification): String {
-        if (sbn.key.isNotBlank()) {
-            return sbn.key
-        }
-        return listOf(sbn.packageName, sbn.id.toString(), sbn.tag.orEmpty(), sbn.postTime.toString())
-            .joinToString("|")
-    }
-
     private data class MessageCandidate(
         val title: String,
         val text: String,
     )
+
+    companion object {
+        private const val TAG = "WhatsAppForwarder"
+    }
 }

@@ -1,7 +1,6 @@
 package com.nbregister.whatsappforwarder.network
 
 import com.google.gson.Gson
-import com.nbregister.whatsappforwarder.data.OtpQueueItem
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,10 +21,10 @@ class OtpWebhookClient {
         .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    fun send(url: String, item: OtpQueueItem): SendResult {
+    fun send(url: String, otp: String): SendResult {
         return try {
             val payload = mapOf(
-                "otp" to item.otp,
+                "otp" to otp,
                 "source" to "whatsapp",
             )
             val body = gson.toJson(payload).toRequestBody(JSON.toMediaType())

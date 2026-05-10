@@ -11,8 +11,6 @@ data class AppSettings(
     val requireKeyword: Boolean,
     val keywords: Set<String>,
     val whatsappPackages: Set<String>,
-    val maxRetries: Int,
-    val batchSize: Int,
 )
 
 class SettingsStore(context: Context) {
@@ -39,14 +37,6 @@ class SettingsStore(context: Context) {
         get() = prefs.getString(KEY_WHATSAPP_PACKAGES, DEFAULT_WHATSAPP_PACKAGES) ?: DEFAULT_WHATSAPP_PACKAGES
         set(value) = prefs.edit { putString(KEY_WHATSAPP_PACKAGES, value) }
 
-    var maxRetries: Int
-        get() = prefs.getInt(KEY_MAX_RETRIES, 10)
-        set(value) = prefs.edit { putInt(KEY_MAX_RETRIES, value.coerceIn(1, 30)) }
-
-    var batchSize: Int
-        get() = prefs.getInt(KEY_BATCH_SIZE, 20)
-        set(value) = prefs.edit { putInt(KEY_BATCH_SIZE, value.coerceIn(1, 100)) }
-
     fun readAll(): AppSettings {
         return AppSettings(
             webhookUrl = webhookUrl,
@@ -54,13 +44,7 @@ class SettingsStore(context: Context) {
             requireKeyword = requireKeyword,
             keywords = parseList(keywordsRaw).map { it.lowercase() }.toSet(),
             whatsappPackages = parseList(whatsappPackagesRaw),
-            maxRetries = maxRetries,
-            batchSize = batchSize,
         )
-    }
-
-    fun isWatchedPackage(packageName: String): Boolean {
-        return parseList(whatsappPackagesRaw).contains(packageName)
     }
 
     companion object {
@@ -72,8 +56,6 @@ class SettingsStore(context: Context) {
         private const val KEY_REQUIRE_KEYWORD = "require_keyword"
         private const val KEY_KEYWORDS = "keywords"
         private const val KEY_WHATSAPP_PACKAGES = "whatsapp_packages"
-        private const val KEY_MAX_RETRIES = "max_retries"
-        private const val KEY_BATCH_SIZE = "batch_size"
 
         fun parseList(raw: String): Set<String> {
             return raw.split(',', '\n', ';')
