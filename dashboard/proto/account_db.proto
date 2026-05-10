@@ -19,6 +19,7 @@ message Account {
   int64 created_at = 12;
   int64 updated_at = 13;
   string access_token = 14;
+  optional bool plus_trial_eligible = 15;
 }
 
 message CreateAccountRequest {

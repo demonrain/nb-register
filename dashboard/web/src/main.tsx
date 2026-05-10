@@ -2,8 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
+  Copy,
+  Database,
   Eye,
   EyeOff,
+  Inbox,
+  KeyRound,
+  ListChecks,
+  Mail,
   Play,
   Plus,
   RefreshCcw,
@@ -24,6 +30,7 @@ type Account = {
   error_message: string;
   session_token: string;
   access_token: string;
+  plus_trial_eligible?: boolean;
   created_at: number;
   updated_at: number;
 };
@@ -43,6 +50,25 @@ type Job = {
   steps?: Step[];
 };
 
+type Mailbox = {
+  email_address: string;
+  password: string;
+  refresh_token: string;
+  access_token: string;
+  status: string;
+  last_error: string;
+  is_primary: boolean;
+  primary_email: string;
+  created_at: number;
+  updated_at: number;
+};
+
+type MailboxOAuthResponse = {
+  started: boolean;
+  job_id: string;
+  error_message: string;
+};
+
 type Step = {
   step_name: string;
   status: string;
@@ -55,38 +81,53 @@ type Step = {
 };
 
 type Toast = { kind: 'ok' | 'error'; text: string } | null;
+type ViewKey = 'accounts' | 'mailboxes' | 'mailboxRegistration' | 'jobs';
 
-const statusOptions = ['', 'CREATED', 'REGISTERED', 'ACTIVATED', 'REGISTER_FAILED', 'PAYMENT_FAILED'];
+const statusOptions = ['', 'CREATED', 'REGISTERED', 'ACTIVATED', 'EMAIL_ALREADY_EXISTS', 'REGISTER_FAILED', 'PAYMENT_FAILED'];
 const jobStatusOptions = ['', 'RUNNING', 'SUCCEEDED', 'FAILED_RETRYABLE', 'FAILED_RECOVERABLE', 'FAILED_FINAL'];
+const mailboxStatusOptions = ['', 'AVAILABLE', 'ASSIGNED', 'REGISTERED', 'USER_ALREADY_EXISTS', 'REGISTRATION_FAILED', 'AUTH_FAILED', 'BLOCKED'];
 
 function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [mailboxes, setMailboxes] = useState<Mailbox[]>([]);
+  const [activeView, setActiveView] = useState<ViewKey>('accounts');
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null);
   const [accountStatus, setAccountStatus] = useState('');
   const [jobStatus, setJobStatus] = useState('');
+  const [mailboxStatus, setMailboxStatus] = useState('');
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [showSecrets, setShowSecrets] = useState(false);
+  const [mailboxRegistering, setMailboxRegistering] = useState(false);
+  const [mailboxOAuthing, setMailboxOAuthing] = useState('');
   const [runningAccountIds, setRunningAccountIds] = useState<Set<string>>(new Set());
   const [runningJobCount, setRunningJobCount] = useState(0);
 
   async function refresh() {
     setBusy(true);
     try {
-      const [accountsData, jobsData, runningJobsData] = await Promise.all([
+      const [accountsData, jobsData, mailboxesData, runningJobsData] = await Promise.all([
         api<Account[]>(`/api/accounts?limit=200${accountStatus ? `&status=${accountStatus}` : ''}`),
         api<Job[]>(`/api/jobs?limit=200${jobStatus ? `&status=${jobStatus}` : ''}`),
+        api<Mailbox[]>(`/api/mailboxes?limit=200${mailboxStatus ? `&status=${mailboxStatus}` : ''}`),
         api<Job[]>('/api/jobs?limit=200&status=RUNNING')
       ]);
       setAccounts(Array.isArray(accountsData) ? accountsData : []);
       setJobs(Array.isArray(jobsData) ? jobsData : []);
+      const nextMailboxes = Array.isArray(mailboxesData) ? mailboxesData : [];
+      setMailboxes(nextMailboxes);
       const runningJobs = Array.isArray(runningJobsData) ? runningJobsData : [];
       setRunningJobCount(runningJobs.length);
       setRunningAccountIds(new Set(runningJobs.filter((job) => job.account_id).map((job) => job.account_id)));
       if (selectedJob) {
         setSelectedJob(await api<Job>(`/api/jobs/${selectedJob.job_id}`));
+      }
+      if (selectedMailbox) {
+        const freshMailbox = nextMailboxes.find((mailbox) => mailbox.email_address === selectedMailbox.email_address);
+        if (freshMailbox) setSelectedMailbox(freshMailbox);
       }
     } catch (err) {
       setToast({ kind: 'error', text: errorText(err) });
@@ -144,6 +185,61 @@ function App() {
     }
   }
 
+  async function submitJobOtp(job: Job, otp: string) {
+    try {
+      const resp = await api<{ success: boolean; job_id: string; error_message?: string }>(`/api/jobs/${job.job_id}/otp`, {
+        method: 'POST',
+        body: JSON.stringify({ otp })
+      });
+      if (resp.error_message || !resp.success) {
+        setToast({ kind: 'error', text: resp.error_message || 'OTP 提交失败' });
+        return;
+      }
+      setToast({ kind: 'ok', text: `OTP 已提交: ${short(resp.job_id || job.job_id)}` });
+      await refresh();
+    } catch (err) {
+      setToast({ kind: 'error', text: errorText(err) });
+      throw err;
+    }
+  }
+
+  async function startMailboxRegistration() {
+    setMailboxRegistering(true);
+    try {
+      const resp = await api<{ started: boolean }>('/api/mailboxes/register', { method: 'POST', body: '{}' });
+      setToast({ kind: resp.started ? 'ok' : 'error', text: resp.started ? '手动注册邮箱已启动' : '手动注册邮箱未启动' });
+      window.setTimeout(refresh, 3000);
+    } catch (err) {
+      setToast({ kind: 'error', text: errorText(err) });
+    } finally {
+      setMailboxRegistering(false);
+    }
+  }
+
+  async function runMailboxOAuth(emailAddress = '') {
+    setMailboxOAuthing(emailAddress || '*');
+    try {
+      const resp = await api<MailboxOAuthResponse>('/api/mailboxes/oauth', {
+        method: 'POST',
+        body: JSON.stringify({
+          email_address: emailAddress,
+          only_missing: !emailAddress,
+          limit: 100
+        })
+      });
+      if (!resp.started || resp.error_message) {
+        setToast({ kind: 'error', text: resp.error_message || 'OAuth 流程启动失败' });
+      } else {
+        setToast({ kind: 'ok', text: `OAuth 流程已提交: ${short(resp.job_id)}` });
+      }
+      await refresh();
+    } catch (err) {
+      setToast({ kind: 'error', text: errorText(err) });
+    } finally {
+      setMailboxOAuthing('');
+    }
+  }
+
   async function updateAccountAuth(account: Account, payload: { session_token?: string; access_token?: string }) {
     setBusy(true);
     try {
@@ -166,7 +262,7 @@ function App() {
     refresh();
     const id = window.setInterval(refresh, 15000);
     return () => window.clearInterval(id);
-  }, [accountStatus, jobStatus]);
+  }, [accountStatus, jobStatus, mailboxStatus]);
 
   useEffect(() => {
     if (!toast) return;
@@ -177,21 +273,40 @@ function App() {
   function selectAccount(account: Account) {
     setSelectedAccount(account);
     setSelectedJob(null);
+    setSelectedMailbox(null);
   }
 
   async function selectJob(job: Job) {
     try {
       setSelectedAccount(null);
+      setSelectedMailbox(null);
       setSelectedJob(await api<Job>(`/api/jobs/${job.job_id}`));
     } catch (err) {
       setToast({ kind: 'error', text: errorText(err) });
     }
   }
 
+  function selectMailbox(mailbox: Mailbox) {
+    setSelectedAccount(null);
+    setSelectedJob(null);
+    setSelectedMailbox(mailbox);
+  }
+
   function closeDetails() {
     setSelectedAccount(null);
     setSelectedJob(null);
+    setSelectedMailbox(null);
   }
+
+  function openView(view: ViewKey) {
+    setActiveView(view);
+    closeDetails();
+  }
+
+  const missingOAuthCount = mailboxes.filter((mailbox) => mailbox.is_primary && mailbox.password && !mailbox.refresh_token).length;
+  const mailboxRegisterJobs = jobs.filter((job) => job.action === 'REGISTER_MAILBOX');
+  const mailboxOAuthJobs = jobs.filter((job) => job.action === 'MAILBOX_OAUTH');
+  const runningMailboxRegisterCount = mailboxRegisterJobs.filter((job) => job.status === 'RUNNING').length;
 
   return (
     <main className="shell">
@@ -209,54 +324,153 @@ function App() {
 
       {toast && <div className={`toast ${toast.kind}`} title={toast.text}>{compactToast(toast.text)}</div>}
 
-      <section className="metrics">
-        <Metric label="账号" value={accounts.length} icon={<ShieldCheck />} />
-        <Metric label="已激活" value={accounts.filter((a) => a.status === 'ACTIVATED').length} icon={<Zap />} />
-        <Metric label="运行中 Job" value={runningJobCount} icon={<Activity />} />
-        <Metric label="可重试失败" value={jobs.filter((j) => j.retryable).length} icon={<RefreshCcw />} />
-      </section>
+      <section className="appFrame">
+        <nav className="navRail" aria-label="主导航">
+          <NavItem active={activeView === 'accounts'} icon={<Database size={17} />} label="账号" count={accounts.length} onClick={() => openView('accounts')} />
+          <NavItem active={activeView === 'mailboxes'} icon={<Inbox size={17} />} label="邮箱管理" count={mailboxes.filter((m) => m.status === 'AVAILABLE').length} onClick={() => openView('mailboxes')} />
+          <NavItem active={activeView === 'mailboxRegistration'} icon={<Play size={17} />} label="邮箱注册" count={runningMailboxRegisterCount} onClick={() => openView('mailboxRegistration')} />
+          <NavItem active={activeView === 'jobs'} icon={<ListChecks size={17} />} label="工作流" count={runningJobCount} onClick={() => openView('jobs')} />
+        </nav>
 
-      <section className="workspace">
-        <div className="panel accountsPanel">
-          <PanelHeader title="账号" icon={<Search size={16} />}>
-            <div className="headerControls">
-              <button className="secondaryButton" onClick={() => setShowSecrets((v) => !v)}>
-                {showSecrets ? <EyeOff size={16} /> : <Eye size={16} />}
-                {showSecrets ? '隐藏' : '显示'}
-              </button>
-              <select value={accountStatus} onChange={(e) => setAccountStatus(e.target.value)}>
-                {statusOptions.map((s) => <option key={s} value={s}>{s || '全部状态'}</option>)}
-              </select>
-            </div>
-          </PanelHeader>
-          <CreateAccountForm
-            onDone={async (message) => {
-              setToast({ kind: 'ok', text: message });
-              await refresh();
-            }}
-            onError={(message) => setToast({ kind: 'error', text: message })}
-          />
-          <AccountTable
-            accounts={accounts}
-            selected={selectedAccount?.account_id}
-            showSecrets={showSecrets}
-            runningAccountIds={runningAccountIds}
-            busy={busy}
-            onSelect={selectAccount}
-            onRegister={(account) => runAccountWorkflow('注册账号', '/api/workflows/register', account)}
-            onActivate={(account) => runAccountWorkflow('激活账号', '/api/workflows/activate', account)}
-            onRegisterActivate={(account) => runAccountWorkflow('注册并激活', '/api/workflows/register-and-activate', account)}
-            onDelete={deleteAccount}
-          />
-        </div>
+        <div className="contentPane">
+          <section className="metrics">
+            <Metric label="账号" value={accounts.length} icon={<ShieldCheck />} />
+            <Metric label="已激活" value={accounts.filter((a) => a.status === 'ACTIVATED').length} icon={<Zap />} />
+            <Metric label="可用邮箱" value={mailboxes.filter((m) => m.status === 'AVAILABLE').length} icon={<Mail />} />
+            <Metric label="运行中 Job" value={runningJobCount} icon={<Activity />} />
+            <Metric label="可重试失败" value={jobs.filter((j) => j.retryable).length} icon={<RefreshCcw />} />
+          </section>
 
-        <div className="panel jobsPanel">
-          <PanelHeader title="工作流" icon={<Activity size={16} />}>
-            <select value={jobStatus} onChange={(e) => setJobStatus(e.target.value)}>
-              {jobStatusOptions.map((s) => <option key={s} value={s}>{s || '全部状态'}</option>)}
-            </select>
-          </PanelHeader>
-          <JobTable jobs={jobs} selected={selectedJob?.job_id} busy={busy} onSelect={selectJob} onRetry={retryJob} />
+          {activeView === 'accounts' && (
+            <section className="workspace accountsWorkspace">
+              <div className="panel accountsPanel">
+                <PanelHeader title="账号" icon={<Search size={16} />}>
+                  <div className="headerControls">
+                    <button className="secondaryButton" onClick={() => setShowSecrets((v) => !v)}>
+                      {showSecrets ? <EyeOff size={16} /> : <Eye size={16} />}
+                      {showSecrets ? '隐藏' : '显示'}
+                    </button>
+                    <select value={accountStatus} onChange={(e) => setAccountStatus(e.target.value)}>
+                      {statusOptions.map((s) => <option key={s} value={s}>{s || '全部状态'}</option>)}
+                    </select>
+                  </div>
+                </PanelHeader>
+                <CreateAccountForm
+                  onDone={async (message) => {
+                    setToast({ kind: 'ok', text: message });
+                    await refresh();
+                  }}
+                  onError={(message) => setToast({ kind: 'error', text: message })}
+                />
+                <AccountTable
+                  accounts={accounts}
+                  selected={selectedAccount?.account_id}
+                  showSecrets={showSecrets}
+                  runningAccountIds={runningAccountIds}
+                  busy={busy}
+                  onSelect={selectAccount}
+                  onRegister={(account) => runAccountWorkflow('注册账号', '/api/workflows/register', account)}
+                  onActivate={(account) => runAccountWorkflow('激活账号', '/api/workflows/activate', account)}
+                  onProbePlusTrial={(account) => runAccountWorkflow('资格探测', '/api/workflows/probe-plus-trial', account)}
+                  onRegisterActivate={(account) => runAccountWorkflow('注册并激活', '/api/workflows/register-and-activate', account)}
+                  onDelete={deleteAccount}
+                />
+              </div>
+
+              <div className="panel jobsPanel compactPanel">
+                <PanelHeader title="最近工作流" icon={<Activity size={16} />}>
+                  <button className="secondaryButton" onClick={() => openView('jobs')}>查看全部</button>
+                </PanelHeader>
+                <JobTable jobs={jobs.slice(0, 8)} selected={selectedJob?.job_id} busy={busy} onSelect={selectJob} onRetry={retryJob} />
+              </div>
+            </section>
+          )}
+
+          {activeView === 'mailboxes' && (
+            <section className="workspace mailboxWorkspace">
+              <div className="panel mailboxesPanel">
+                <PanelHeader title="邮箱管理" icon={<Mail size={16} />}>
+                  <div className="headerControls">
+                    <button className="secondaryButton" onClick={() => runMailboxOAuth()} disabled={busy || !!mailboxOAuthing || missingOAuthCount === 0}>
+                      <KeyRound size={16} /> 补 OAuth {missingOAuthCount > 0 ? `(${missingOAuthCount})` : ''}
+                    </button>
+                    <button className="secondaryButton" onClick={() => setShowSecrets((v) => !v)}>
+                      {showSecrets ? <EyeOff size={16} /> : <Eye size={16} />}
+                      {showSecrets ? '隐藏' : '显示'}
+                    </button>
+                    <select value={mailboxStatus} onChange={(e) => setMailboxStatus(e.target.value)}>
+                      {mailboxStatusOptions.map((s) => <option key={s} value={s}>{s || '全部状态'}</option>)}
+                    </select>
+                  </div>
+                </PanelHeader>
+                <MailboxPanel
+                  mailboxes={mailboxes}
+	                  selected={selectedMailbox?.email_address}
+	                  busy={busy}
+	                  showSecrets={showSecrets}
+                    oauthing={mailboxOAuthing}
+	                  onSelect={selectMailbox}
+                    onOAuth={runMailboxOAuth}
+	                  onDone={async (message) => {
+	                    setToast({ kind: 'ok', text: message });
+	                    await refresh();
+                  }}
+                  onError={(message) => setToast({ kind: 'error', text: message })}
+                />
+                {mailboxOAuthJobs.length > 0 && (
+                  <>
+                    <div className="sectionTitle">
+                      <h3>OAuth Job</h3>
+                      <button className="secondaryButton" onClick={() => openView('jobs')}>
+                        <ListChecks size={14} /> 全部工作流
+                      </button>
+                    </div>
+                    <JobTable jobs={mailboxOAuthJobs.slice(0, 10)} selected={selectedJob?.job_id} busy={busy} onSelect={selectJob} onRetry={retryJob} />
+                  </>
+                )}
+	              </div>
+	            </section>
+	          )}
+
+	          {activeView === 'mailboxRegistration' && (
+	            <section className="workspace mailboxRegistrationWorkspace">
+	              <div className="panel mailboxRegisterPanel">
+	                <PanelHeader title="邮箱注册" icon={<Play size={16} />}>
+	                  <div className="headerControls">
+	                    <button className="primaryButton" onClick={startMailboxRegistration} disabled={busy || mailboxRegistering}>
+	                      <Play size={16} /> 启动注册
+	                    </button>
+	                    <button className="secondaryButton" onClick={() => openView('mailboxes')}>
+	                      <Inbox size={16} /> 邮箱管理
+	                    </button>
+	                  </div>
+	                </PanelHeader>
+	                <div className="mailboxRegisterBody">
+	                  <MailboxStatusStrip mailboxes={mailboxes} />
+	                  <div className="sectionTitle">
+	                    <h3>邮箱注册 Job</h3>
+	                    <button className="secondaryButton" onClick={() => openView('jobs')}>
+	                      <ListChecks size={14} /> 全部工作流
+	                    </button>
+	                  </div>
+	                  <JobTable jobs={mailboxRegisterJobs.slice(0, 20)} selected={selectedJob?.job_id} busy={busy} onSelect={selectJob} onRetry={retryJob} />
+	                </div>
+	              </div>
+	            </section>
+	          )}
+
+	          {activeView === 'jobs' && (
+            <section className="workspace jobsWorkspace">
+              <div className="panel jobsPanel">
+                <PanelHeader title="工作流" icon={<Activity size={16} />}>
+                  <select value={jobStatus} onChange={(e) => setJobStatus(e.target.value)}>
+                    {jobStatusOptions.map((s) => <option key={s} value={s}>{s || '全部状态'}</option>)}
+                  </select>
+                </PanelHeader>
+                <JobTable jobs={jobs} selected={selectedJob?.job_id} busy={busy} onSelect={selectJob} onRetry={retryJob} />
+              </div>
+            </section>
+          )}
         </div>
       </section>
 
@@ -265,8 +479,10 @@ function App() {
           <AccountDetails
             account={selectedAccount}
             showSecrets={showSecrets}
+            busy={busy}
             onSessionSave={(account, sessionToken) => updateAccountAuth(account, { session_token: sessionToken })}
             onAccessSave={(account, accessToken) => updateAccountAuth(account, { access_token: accessToken })}
+            onProbePlusTrial={(account) => runAccountWorkflow('资格探测', '/api/workflows/probe-plus-trial', account)}
           />
         )}
       </DetailDrawer>
@@ -277,10 +493,33 @@ function App() {
             job={selectedJob}
             busy={busy}
             onJobRetry={retryJob}
+            onOtpSubmit={submitJobOtp}
           />
         )}
       </DetailDrawer>
+
+      <DetailDrawer open={!!selectedMailbox} title="邮箱详情" onClose={closeDetails}>
+        {selectedMailbox && (
+          <MailboxDetails mailbox={selectedMailbox} showSecrets={showSecrets} />
+        )}
+      </DetailDrawer>
     </main>
+  );
+}
+
+function NavItem({ active, icon, label, count, onClick }: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`navItem ${active ? 'active' : ''}`} onClick={onClick}>
+      <span>{icon}</span>
+      <strong>{label}</strong>
+      <em>{count}</em>
+    </button>
   );
 }
 
@@ -338,18 +577,26 @@ function DetailDrawer({ open, title, onClose, children }: {
   );
 }
 
-function AccountDetails({ account, showSecrets, onSessionSave, onAccessSave }: {
+function AccountDetails({ account, showSecrets, busy, onSessionSave, onAccessSave, onProbePlusTrial }: {
   account: Account;
   showSecrets: boolean;
+  busy: boolean;
   onSessionSave: (account: Account, sessionToken: string) => Promise<void>;
   onAccessSave: (account: Account, accessToken: string) => Promise<void>;
+  onProbePlusTrial: (account: Account) => void;
 }) {
   return (
     <div className="details">
       <section>
-        <h3>账号</h3>
+        <div className="sectionTitle">
+          <h3>账号</h3>
+          <button disabled={busy || !canProbePlusTrial(account)} onClick={() => onProbePlusTrial(account)}>
+            <Search size={14} /> 探测资格
+          </button>
+        </div>
         <KV label="ID" value={account.account_id} mono />
         <KV label="Status" value={account.status || '-'} />
+        <KV label="试用资格" value={trialText(account.plus_trial_eligible)} />
         <KV label="Email" value={account.email} />
         <KV label="Password" value={showSecrets ? account.password : mask(account.password)} mono />
         <TokenEditor label="Session" field="session_token" account={account} showSecrets={showSecrets} onSave={onSessionSave} />
@@ -362,24 +609,28 @@ function AccountDetails({ account, showSecrets, onSessionSave, onAccessSave }: {
   );
 }
 
-function JobDetails({ job, busy, onJobRetry }: {
+function JobDetails({ job, busy, onJobRetry, onOtpSubmit }: {
   job: Job;
   busy: boolean;
   onJobRetry: (job: Job) => void;
+  onOtpSubmit: (job: Job, otp: string) => Promise<void>;
 }) {
   return (
     <div className="details">
       <section>
         <div className="sectionTitle">
           <h3>工作流</h3>
-          <button disabled={busy || job.status === 'RUNNING'} onClick={() => onJobRetry(job)}>
-            <RefreshCcw size={14} /> 重试
-          </button>
+          {canRetryJob(job) && (
+            <button disabled={busy} onClick={() => onJobRetry(job)}>
+              <RefreshCcw size={14} /> 重试
+            </button>
+          )}
         </div>
         <KV label="Job" value={job.job_id} mono />
         <KV label="Action" value={job.action} />
         <KV label="Status" value={job.status} />
         <KV label="Error" value={job.error_message || '-'} />
+        {canSubmitOtp(job) && <OtpSubmitter job={job} onSubmit={onOtpSubmit} />}
         <div className="timeline">
           {(job.steps || []).map((step) => (
             <div className="step" key={step.step_name}>
@@ -396,7 +647,49 @@ function JobDetails({ job, busy, onJobRetry }: {
     </div>
   );
 }
-function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy, onSelect, onRegister, onActivate, onRegisterActivate, onDelete }: {
+
+function OtpSubmitter({ job, onSubmit }: {
+  job: Job;
+  onSubmit: (job: Job, otp: string) => Promise<void>;
+}) {
+  const [otp, setOtp] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit() {
+    const value = otp.trim();
+    if (!value) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(job, value);
+      setOtp('');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="otpSubmitter">
+      <span><KeyRound size={14} /> 注册 OTP</span>
+      <div>
+        <input
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          placeholder="验证码"
+          value={otp}
+          onChange={(event) => setOtp(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') void submit();
+          }}
+        />
+        <button className="primaryButton" disabled={submitting || !otp.trim()} onClick={() => void submit()}>
+          <KeyRound size={14} /> 提交
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy, onSelect, onRegister, onActivate, onProbePlusTrial, onRegisterActivate, onDelete }: {
   accounts: Account[];
   selected?: string;
   showSecrets: boolean;
@@ -405,6 +698,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy
   onSelect: (a: Account) => void;
   onRegister: (a: Account) => void;
   onActivate: (a: Account) => void;
+  onProbePlusTrial: (a: Account) => void;
   onRegisterActivate: (a: Account) => void;
   onDelete: (a: Account) => void;
 }) {
@@ -416,6 +710,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy
             <th>账号</th>
             <th>密码</th>
             <th>状态</th>
+            <th>试用</th>
             <th>Session</th>
             <th>Access</th>
             <th>更新</th>
@@ -435,6 +730,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy
                 </td>
                 <td className="secret">{showSecrets ? account.password : mask(account.password)}</td>
                 <td><StatusBadge status={account.status} /></td>
+                <td><TrialBadge eligible={account.plus_trial_eligible} /></td>
                 <td className="mono">{showSecrets ? short(account.session_token, 18) : mask(account.session_token)}</td>
                 <td className="mono">{showSecrets ? short(account.access_token, 18) : mask(account.access_token)}</td>
                 <td>{formatUnix(account.updated_at)}</td>
@@ -446,6 +742,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, busy
                       <>
                         {canRegister(account) && <button title="注册" disabled={busy} onClick={() => onRegister(account)}><Play size={14} /></button>}
                         {canActivate(account) && <button title="激活" disabled={busy} onClick={() => onActivate(account)}><Zap size={14} /></button>}
+                        {canProbePlusTrial(account) && <button title="探测 Plus 试用资格" disabled={busy} onClick={() => onProbePlusTrial(account)}><Search size={14} /></button>}
                         {canRegister(account) && <button title="注册并激活" disabled={busy} onClick={() => onRegisterActivate(account)}><ShieldCheck size={14} /></button>}
                         <button className="dangerButton" title="删除账号" disabled={busy} onClick={() => onDelete(account)}><Trash2 size={14} /></button>
                       </>
@@ -483,15 +780,196 @@ function JobTable({ jobs, selected, busy, onSelect, onRetry }: {
               <td>{job.last_step || '-'}</td>
               <td>
                 <div className="rowActions" onClick={(event) => event.stopPropagation()}>
-                  <button title="按同参数重试" disabled={busy || job.status === 'RUNNING'} onClick={() => onRetry(job)}>
-                    <RefreshCcw size={14} />
-                  </button>
+                  {canRetryJob(job) ? (
+                    <button title="按同参数重试" disabled={busy} onClick={() => onRetry(job)}>
+                      <RefreshCcw size={14} />
+                    </button>
+                  ) : (
+                    <span className="muted">-</span>
+                  )}
                 </div>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function MailboxPanel({ mailboxes, selected, busy, showSecrets, oauthing, onSelect, onOAuth, onDone, onError }: {
+  mailboxes: Mailbox[];
+  selected?: string;
+  busy: boolean;
+  showSecrets: boolean;
+  oauthing: string;
+  onSelect: (mailbox: Mailbox) => void;
+  onOAuth: (emailAddress?: string) => Promise<void>;
+  onDone: (message: string) => void;
+  onError: (message: string) => void;
+}) {
+  const [form, setForm] = useState({ email: '', password: '', refresh_token: '', access_token: '', status: 'AVAILABLE' });
+  const [working, setWorking] = useState(false);
+
+  function update(key: keyof typeof form, value: string) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function saveMailbox() {
+    setWorking(true);
+    try {
+      const payload = { ...form, status: form.status || 'AVAILABLE' };
+      const resp = await api<Mailbox>('/api/mailboxes', { method: 'POST', body: JSON.stringify(payload) });
+      setForm({ email: '', password: '', refresh_token: '', access_token: '', status: 'AVAILABLE' });
+      onDone(`邮箱已入池: ${resp.email_address}`);
+    } catch (err) {
+      onError(errorText(err));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  return (
+    <>
+      <MailboxStatusStrip mailboxes={mailboxes} />
+      <div className="mailboxForm">
+        <input placeholder="邮箱" value={form.email} onChange={(e) => update('email', e.target.value)} />
+        <input placeholder="邮箱密码，可空" type="password" value={form.password} onChange={(e) => update('password', e.target.value)} />
+        <input placeholder="Refresh token，可空" type="password" value={form.refresh_token} onChange={(e) => update('refresh_token', e.target.value)} />
+        <input placeholder="Access token，可空" type="password" value={form.access_token} onChange={(e) => update('access_token', e.target.value)} />
+        <select value={form.status} onChange={(e) => update('status', e.target.value)}>
+          {mailboxStatusOptions.filter(Boolean).map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <button onClick={saveMailbox} disabled={busy || working || !form.email.trim()}><Plus size={15} /> 入池</button>
+      </div>
+      <div className="tableWrap">
+        <table>
+          <thead>
+            <tr><th>邮箱</th><th>类型</th><th>状态</th><th>Token</th><th>更新</th><th>错误</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            {mailboxes.map((mailbox) => {
+              const isOAuthing = oauthing === mailbox.email_address || oauthing === '*';
+              const canOAuth = mailbox.is_primary && !!mailbox.password;
+              return (
+                <tr key={mailbox.email_address} className={selected === mailbox.email_address ? 'selected' : ''} onClick={() => onSelect(mailbox)}>
+                  <td>
+                    <div className="cellStack">
+                      <span>{showSecrets ? mailbox.email_address : maskEmail(mailbox.email_address)}</span>
+                      <small>{mailbox.primary_email || '-'}</small>
+                    </div>
+                  </td>
+                  <td>{mailbox.is_primary ? '主邮箱' : 'Alias'}</td>
+                  <td><StatusBadge status={mailbox.status} /></td>
+                  <td><TokenBadge mailbox={mailbox} /></td>
+                  <td>{formatUnix(mailbox.updated_at)}</td>
+                  <td title={mailbox.last_error}>{compactToast(mailbox.last_error || '-')}</td>
+                  <td>
+                    <div className="rowActions" onClick={(event) => event.stopPropagation()}>
+                      {canOAuth ? (
+                        <button title="启动 OAuth 流程" disabled={busy || !!oauthing} onClick={() => onOAuth(mailbox.email_address)}>
+                          <KeyRound size={14} /> {isOAuthing ? '提交中' : 'OAuth'}
+                        </button>
+                      ) : (
+                        <span className="muted">-</span>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function MailboxOAuthTable({ mailboxes, busy, showSecrets, oauthing, onOAuth }: {
+  mailboxes: Mailbox[];
+  busy: boolean;
+  showSecrets: boolean;
+  oauthing: string;
+  onOAuth: (emailAddress?: string) => Promise<void>;
+}) {
+  return (
+    <div className="tableWrap oauthTableWrap">
+      <table>
+        <thead>
+          <tr><th>邮箱</th><th>状态</th><th>Token</th><th>更新</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          {mailboxes.map((mailbox) => {
+            const isOAuthing = oauthing === mailbox.email_address || oauthing === '*';
+            return (
+              <tr key={mailbox.email_address}>
+                <td>
+                  <div className="cellStack">
+                    <span>{showSecrets ? mailbox.email_address : maskEmail(mailbox.email_address)}</span>
+                    <small>{mailbox.refresh_token ? '已授权' : '缺 OAuth'}</small>
+                  </div>
+                </td>
+                <td><StatusBadge status={mailbox.status} /></td>
+                <td><TokenBadge mailbox={mailbox} /></td>
+                <td>{formatUnix(mailbox.updated_at)}</td>
+                <td>
+                  <button
+                    className="rowButton"
+                    title="执行 Microsoft OAuth"
+                    disabled={busy || !!oauthing}
+                    onClick={() => onOAuth(mailbox.email_address)}
+                  >
+                    <KeyRound size={14} /> {isOAuthing ? '处理中' : 'OAuth'}
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MailboxStatusStrip({ mailboxes }: { mailboxes: Mailbox[] }) {
+  const items = [
+    ['AVAILABLE', '可用'],
+    ['ASSIGNED', '已分配'],
+    ['REGISTERED', '已注册'],
+    ['AUTH_FAILED', '认证失败'],
+    ['BLOCKED', '已封禁']
+  ];
+  return (
+    <div className="mailboxStatusStrip">
+      {items.map(([status, label]) => (
+        <div key={status}>
+          <strong>{mailboxes.filter((mailbox) => mailbox.status === status).length}</strong>
+          <span>{label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MailboxDetails({ mailbox, showSecrets }: {
+  mailbox: Mailbox;
+  showSecrets: boolean;
+}) {
+  return (
+    <div className="details">
+      <section>
+        <h3>邮箱</h3>
+        <KV label="Email" value={showSecrets ? mailbox.email_address : maskEmail(mailbox.email_address)} />
+        <KV label="Password" value={showSecrets ? mailbox.password : mask(mailbox.password)} mono />
+        <KV label="Status" value={mailbox.status || '-'} />
+        <KV label="Type" value={mailbox.is_primary ? '主邮箱' : 'Alias'} />
+        <KV label="Primary" value={mailbox.primary_email || '-'} />
+        <KV label="Refresh" value={showSecrets ? mailbox.refresh_token : mask(mailbox.refresh_token)} mono />
+        <KV label="Access" value={showSecrets ? mailbox.access_token : mask(mailbox.access_token)} mono />
+        <KV label="Created" value={formatUnix(mailbox.created_at)} />
+        <KV label="Updated" value={formatUnix(mailbox.updated_at)} />
+        <KV label="Error" value={mailbox.last_error || '-'} />
+      </section>
     </div>
   );
 }
@@ -574,6 +1052,9 @@ function TokenEditor({ label, field, account, showSecrets, onSave }: {
         onChange={(event) => setValue(event.target.value)}
         placeholder={`${label.toLowerCase()} token`}
       />
+      <button className="copyButton" title={`复制 ${label}`} disabled={!value.trim()} onClick={() => copyText(value)}>
+        <Copy size={14} />
+      </button>
       <button onClick={save} disabled={saving || value.trim() === current}>
         <Save size={14} /> 保存
       </button>
@@ -582,12 +1063,32 @@ function TokenEditor({ label, field, account, showSecrets, onSave }: {
 }
 
 function KV({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return <div className="kv"><span>{label}</span><button className={mono ? 'mono' : ''} onClick={() => navigator.clipboard?.writeText(value)}>{value || '-'}</button></div>;
+  return (
+    <div className="kv">
+      <span>{label}</span>
+      <button className={mono ? 'mono valueButton' : 'valueButton'} onClick={() => copyText(value)}>{value || '-'}</button>
+      <button className="copyButton" title={`复制 ${label}`} disabled={!value} onClick={() => copyText(value)}>
+        <Copy size={14} />
+      </button>
+    </div>
+  );
 }
 
 function StatusBadge({ status, retryable }: { status: string; retryable?: boolean }) {
-  const cls = status.includes('FAILED') ? 'bad' : status === 'SUCCEEDED' || status === 'ACTIVATED' || status === 'REGISTERED' ? 'good' : 'mid';
+  const cls = status.includes('FAILED') || status.includes('EXISTS') || status === 'BLOCKED' ? 'bad' : status === 'SUCCEEDED' || status === 'ACTIVATED' || status === 'REGISTERED' ? 'good' : 'mid';
   return <span className={`badge ${cls}`}>{status || '-'}{retryable ? ' / retry' : ''}</span>;
+}
+
+function TrialBadge({ eligible }: { eligible?: boolean }) {
+  if (eligible === true) return <span className="badge good">0元</span>;
+  if (eligible === false) return <span className="badge bad">非0元</span>;
+  return <span className="badge mid">未知</span>;
+}
+
+function TokenBadge({ mailbox }: { mailbox: Mailbox }) {
+  if (mailbox.refresh_token) return <span className="badge good">Refresh</span>;
+  if (mailbox.access_token) return <span className="badge mid">Access</span>;
+  return <span className="badge bad">None</span>;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -598,15 +1099,27 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function canRegister(account: Account) {
-  return !hasRegisteredSession(account);
+  return account.status !== 'EMAIL_ALREADY_EXISTS' && !hasRegisteredSession(account);
 }
 
 function canActivate(account: Account) {
   return account.status !== 'ACTIVATED' && (!!account.session_token || !!account.access_token);
 }
 
+function canProbePlusTrial(account: Account) {
+  return account.status !== 'ACTIVATED' && !!account.session_token;
+}
+
 function hasRegisteredSession(account: Account) {
   return account.status === 'REGISTERED' || account.status === 'ACTIVATED' || !!account.session_token || !!account.access_token;
+}
+
+function canRetryJob(job: Job) {
+  return job.retryable && job.status.startsWith('FAILED');
+}
+
+function canSubmitOtp(job: Job) {
+  return job.status === 'RUNNING' && (job.action === 'REGISTER' || job.action === 'REGISTER_AND_ACTIVATE');
 }
 
 function short(value: string, size = 8) {
@@ -617,8 +1130,21 @@ function mask(value: string) {
   return value ? '••••••••' : '-';
 }
 
+function maskEmail(value: string) {
+  if (!value) return '-';
+  const [local, domain] = value.split('@');
+  if (!local || !domain) return mask(value);
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
 function formatUnix(value: number) {
   return value ? new Date(value * 1000).toLocaleString() : '-';
+}
+
+function trialText(value?: boolean) {
+  if (value === true) return '0元试用';
+  if (value === false) return '非0元';
+  return '未知';
 }
 
 function errorText(err: unknown) {
@@ -636,6 +1162,11 @@ function formatJSON(value: string) {
   } catch {
     return value;
   }
+}
+
+function copyText(value: string) {
+  if (!value) return;
+  void navigator.clipboard?.writeText(value);
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

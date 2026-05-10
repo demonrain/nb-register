@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -15,6 +16,9 @@ const (
 	resolveAccountActivityName    = "ResolveAccountFromJobActivity"
 	registerAccountActivityName   = "RegisterAccountAtomicActivity"
 	goPayPaymentActivityName      = "GoPayPaymentAtomicActivity"
+	probePlusTrialActivityName    = "ProbePlusTrialAtomicActivity"
+	registerMailboxActivityName   = "RegisterMailboxAtomicActivity"
+	mailboxOAuthActivityName      = "MailboxOAuthAtomicActivity"
 	persistRegisteredActivityName = "PersistRegisteredActivity"
 	persistActivatedActivityName  = "PersistActivatedActivity"
 	markJobFailedActivityName     = "MarkJobFailedActivity"
@@ -45,13 +49,16 @@ func RegisterAccountWorkflow(ctx workflow.Context, input RegisterAccountWorkflow
 		JobID:     input.JobID,
 		AccountID: account.AccountID,
 	}).Get(ctx, &register); err != nil {
-		return failRegisterWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterAccount, statusFailedRetryable, false, true, err, register.Data), nil
+		status, recoverable, retryable := registerFailurePolicy(err)
+		return failRegisterWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterAccount, status, recoverable, retryable, err, register.Data), nil
 	}
 
 	if err := workflow.ExecuteActivity(retryCtx, persistRegisteredActivityName, PersistRegisteredInput{
-		AccountID:    account.AccountID,
-		SessionToken: register.SessionToken,
-		AccessToken:  register.AccessToken,
+		AccountID:         account.AccountID,
+		SessionToken:      register.SessionToken,
+		AccessToken:       register.AccessToken,
+		PlusTrialEligible: register.PlusTrialEligible,
+		PlusTrialChecked:  register.PlusTrialChecked,
 	}).Get(ctx, nil); err != nil {
 		return failRegisterWorkflow(ctx, retryCtx, result, input.JobID, "", statusFailedRecoverable, true, false, err, register.Data), nil
 	}
@@ -100,8 +107,10 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	}
 
 	if err := workflow.ExecuteActivity(retryCtx, persistActivatedActivityName, PersistActivatedInput{
-		AccountID: account.AccountID,
-		ChargeRef: payment.ChargeRef,
+		AccountID:         account.AccountID,
+		ChargeRef:         payment.ChargeRef,
+		PlusTrialEligible: payment.PlusTrialEligible,
+		PlusTrialChecked:  payment.PlusTrialChecked,
 	}).Get(ctx, nil); err != nil {
 		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, "", statusFailedRecoverable, true, false, err, payment.Data), nil
 	}
@@ -114,6 +123,52 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	result.Success = true
 	result.ChargeRef = payment.ChargeRef
 	result.SnapToken = payment.SnapToken
+	return result, nil
+}
+
+func ProbePlusTrialWorkflow(ctx workflow.Context, input ProbePlusTrialWorkflowInput) (ProbePlusTrialWorkflowResult, error) {
+	result := ProbePlusTrialWorkflowResult{JobID: input.JobID}
+	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
+	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
+
+	var account AccountRef
+	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
+		AccountID: input.AccountID,
+	}).Get(ctx, &account); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, nil
+	}
+
+	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
+		JobID:     input.JobID,
+		AccountID: account.AccountID,
+		Action:    actionProbePlusTrial,
+	}).Get(ctx, nil); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, nil
+	}
+
+	var probe ProbePlusTrialActivityOutput
+	if err := workflow.ExecuteActivity(atomicCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
+		JobID:     input.JobID,
+		AccountID: account.AccountID,
+	}).Get(ctx, &probe); err != nil {
+		return failProbePlusTrialWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, err, probe.Data), nil
+	}
+
+	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
+		JobID:  input.JobID,
+		Result: probe.Data,
+	}).Get(ctx, nil)
+
+	result.Success = probe.Success
+	result.Checked = probe.Checked
+	result.PlusTrialEligible = probe.PlusTrialEligible
+	result.Amount = probe.Amount
+	result.Currency = probe.Currency
+	result.Source = probe.Source
+	result.CheckoutURL = probe.CheckoutURL
+	result.ErrorMessage = probe.ErrorMessage
 	return result, nil
 }
 
@@ -141,13 +196,16 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 		JobID:     input.JobID,
 		AccountID: account.AccountID,
 	}).Get(ctx, &register); err != nil {
-		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterAccount, statusFailedRetryable, false, true, err, register.Data), nil
+		status, recoverable, retryable := registerFailurePolicy(err)
+		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterAccount, status, recoverable, retryable, err, register.Data), nil
 	}
 
 	if err := workflow.ExecuteActivity(retryCtx, persistRegisteredActivityName, PersistRegisteredInput{
-		AccountID:    account.AccountID,
-		SessionToken: register.SessionToken,
-		AccessToken:  register.AccessToken,
+		AccountID:         account.AccountID,
+		SessionToken:      register.SessionToken,
+		AccessToken:       register.AccessToken,
+		PlusTrialEligible: register.PlusTrialEligible,
+		PlusTrialChecked:  register.PlusTrialChecked,
 	}).Get(ctx, nil); err != nil {
 		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, "", statusFailedRecoverable, true, false, err, register.Data), nil
 	}
@@ -165,10 +223,12 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 
 	combined := map[string]any{"register_account": register.Data, "gopay_payment": payment.Data}
 	if err := workflow.ExecuteActivity(retryCtx, persistActivatedActivityName, PersistActivatedInput{
-		AccountID:    account.AccountID,
-		SessionToken: register.SessionToken,
-		AccessToken:  register.AccessToken,
-		ChargeRef:    payment.ChargeRef,
+		AccountID:         account.AccountID,
+		SessionToken:      register.SessionToken,
+		AccessToken:       register.AccessToken,
+		ChargeRef:         payment.ChargeRef,
+		PlusTrialEligible: payment.PlusTrialEligible,
+		PlusTrialChecked:  payment.PlusTrialChecked,
 	}).Get(ctx, nil); err != nil {
 		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, "", statusFailedRecoverable, true, false, err, combined), nil
 	}
@@ -180,11 +240,99 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 
 	result.SessionToken = register.SessionToken
 	result.AccessToken = register.AccessToken
-	result.PlusTrialEligible = register.PlusTrialEligible
+	result.PlusTrialEligible = payment.PlusTrialEligible || register.PlusTrialEligible
 	result.CheckoutURL = register.CheckoutURL
 	result.ActivationSuccess = true
 	result.ChargeRef = payment.ChargeRef
 	result.SnapToken = payment.SnapToken
+	return result, nil
+}
+
+func RegisterMailboxWorkflow(ctx workflow.Context, input RegisterMailboxWorkflowInput) (RegisterMailboxWorkflowResult, error) {
+	result := RegisterMailboxWorkflowResult{JobID: input.JobID}
+	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
+	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
+
+	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
+		JobID:  input.JobID,
+		Action: actionRegisterMailbox,
+		Params: map[string]string{
+			"import_only": boolString(input.ImportOnly),
+		},
+	}).Get(ctx, nil); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, nil
+	}
+
+	var registration MailboxRegistrationActivityOutput
+	if err := workflow.ExecuteActivity(atomicCtx, registerMailboxActivityName, MailboxRegistrationActivityInput{
+		JobID:      input.JobID,
+		Enabled:    !input.ImportOnly,
+		ImportOnly: input.ImportOnly,
+	}).Get(ctx, &registration); err != nil {
+		return failRegisterMailboxWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterMailbox, statusFailedRetryable, false, true, err, registration.Data), nil
+	}
+	if !registration.Success {
+		err := temporal.NewApplicationError(registration.ErrorMessage, "MailboxRegistrationFailed")
+		return failRegisterMailboxWorkflow(ctx, retryCtx, result, input.JobID, stepRegisterMailbox, statusFailedRetryable, false, true, err, registration.Data), nil
+	}
+
+	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
+		JobID:  input.JobID,
+		Result: registration.Data,
+	}).Get(ctx, nil)
+
+	result.Success = registration.Success
+	result.ExitCode = registration.ExitCode
+	result.Mailboxes = registration.Mailboxes
+	return result, nil
+}
+
+func MailboxOAuthWorkflow(ctx workflow.Context, input MailboxOAuthWorkflowInput) (MailboxOAuthWorkflowResult, error) {
+	result := MailboxOAuthWorkflowResult{JobID: input.JobID}
+	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
+	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
+
+	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
+		JobID:  input.JobID,
+		Action: actionMailboxOAuth,
+		Params: map[string]string{
+			"email_address": input.EmailAddress,
+			"only_missing":  boolString(input.OnlyMissing),
+			"limit":         int32String(input.Limit),
+		},
+	}).Get(ctx, nil); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, nil
+	}
+
+	var oauth MailboxOAuthActivityOutput
+	if err := workflow.ExecuteActivity(atomicCtx, mailboxOAuthActivityName, MailboxOAuthActivityInput{
+		JobID:        input.JobID,
+		EmailAddress: input.EmailAddress,
+		OnlyMissing:  input.OnlyMissing,
+		Limit:        input.Limit,
+	}).Get(ctx, &oauth); err != nil {
+		return failMailboxOAuthWorkflow(ctx, retryCtx, result, input.JobID, stepMailboxOAuth, statusFailedRetryable, false, true, err, oauth.Data), nil
+	}
+	if !oauth.Success {
+		msg := oauth.ErrorMessage
+		if msg == "" {
+			msg = "mailbox OAuth failed"
+		}
+		err := temporal.NewApplicationError(msg, "MailboxOAuthFailed")
+		return failMailboxOAuthWorkflow(ctx, retryCtx, result, input.JobID, stepMailboxOAuth, statusFailedRetryable, false, true, err, oauth.Data), nil
+	}
+
+	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
+		JobID:  input.JobID,
+		Result: oauth.Data,
+	}).Get(ctx, nil)
+
+	result.Success = oauth.Success
+	result.Processed = oauth.Processed
+	result.Succeeded = oauth.Succeeded
+	result.Failed = oauth.Failed
 	return result, nil
 }
 
@@ -200,7 +348,25 @@ func failActivateWorkflow(ctx workflow.Context, activityCtx workflow.Context, re
 	return result
 }
 
+func failProbePlusTrialWorkflow(ctx workflow.Context, activityCtx workflow.Context, result ProbePlusTrialWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) ProbePlusTrialWorkflowResult {
+	result.ErrorMessage = err.Error()
+	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
+	return result
+}
+
 func failRegisterAndActivateWorkflow(ctx workflow.Context, activityCtx workflow.Context, result RegisterAndActivateWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) RegisterAndActivateWorkflowResult {
+	result.ErrorMessage = err.Error()
+	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
+	return result
+}
+
+func failRegisterMailboxWorkflow(ctx workflow.Context, activityCtx workflow.Context, result RegisterMailboxWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) RegisterMailboxWorkflowResult {
+	result.ErrorMessage = err.Error()
+	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
+	return result
+}
+
+func failMailboxOAuthWorkflow(ctx workflow.Context, activityCtx workflow.Context, result MailboxOAuthWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) MailboxOAuthWorkflowResult {
 	result.ErrorMessage = err.Error()
 	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
 	return result
@@ -237,4 +403,18 @@ func retryableActivityOptions(timeout time.Duration, attempts int32) workflow.Ac
 			MaximumAttempts:    attempts,
 		},
 	}
+}
+
+func boolString(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func int32String(value int32) string {
+	if value == 0 {
+		return ""
+	}
+	return strconv.FormatInt(int64(value), 10)
 }

@@ -32,6 +32,7 @@ from gopay import (
     _build_chatgpt_session,
     _extract_otp_from_payload,
     _load_cfg,
+    probe_plus_trial_checkout,
     resolve_gopay_cfg,
     resolve_proxy,
     validate_gopay_cfg,
@@ -363,6 +364,75 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
 
     def close(self) -> None:
         self._flows.close()
+
+    def ProbePlusTrial(self, request, context):
+        session_token = (request.session_token or "").strip()
+        access_token = (getattr(request, "access_token", "") or "").strip()
+        if session_token and not access_token and _looks_access_token(session_token):
+            access_token = session_token
+            session_token = ""
+
+        if not (session_token or access_token):
+            return payment_pb2.ProbePlusTrialPaymentResponse(
+                success=False,
+                error_message="session_token or access_token is required",
+            )
+
+        cs_session = None
+        try:
+            cfg = copy.deepcopy(self._cfg)
+            fresh_checkout = cfg.get("fresh_checkout") or {}
+            auth_cfg = dict(fresh_checkout.get("auth") or {})
+            auth_cfg.pop("cookie_header", None)
+            auth_cfg.pop("session_token", None)
+            auth_cfg.pop("access_token", None)
+            if session_token:
+                auth_cfg["session_token"] = session_token
+            if access_token:
+                auth_cfg["access_token"] = access_token
+
+            proxy = resolve_proxy(cfg)
+            cs_session = _build_chatgpt_session(auth_cfg, proxy=proxy)
+            stripe_pk = (
+                (cfg.get("stripe") or {}).get("publishable_key")
+                or auth_cfg.get("stripe_pk")
+                or DEFAULT_STRIPE_PK
+            )
+
+            logger.info("[payment] ProbePlusTrial start")
+            result = probe_plus_trial_checkout(
+                cs_session,
+                stripe_pk=stripe_pk,
+                runtime_cfg=dict(cfg.get("runtime") or {}),
+                proxy=proxy,
+                log=logger.info,
+            )
+            logger.info(
+                "[payment] ProbePlusTrial checked=%s eligible=%s amount=%s source=%s",
+                result.get("checked"),
+                result.get("plus_trial_eligible"),
+                result.get("amount"),
+                result.get("source"),
+            )
+            return payment_pb2.ProbePlusTrialPaymentResponse(
+                success=True,
+                error_message=str(result.get("error_message") or "")[:500],
+                checked=bool(result.get("checked")),
+                plus_trial_eligible=bool(result.get("plus_trial_eligible")),
+                amount=int(result.get("amount") or 0),
+                currency=str(result.get("currency") or ""),
+                source=str(result.get("source") or ""),
+                checkout_url=str(result.get("checkout_url") or ""),
+            )
+        except GoPayError as exc:
+            logger.error("[payment] ProbePlusTrial failed: %s", exc)
+            return payment_pb2.ProbePlusTrialPaymentResponse(success=False, error_message=str(exc)[:500])
+        except Exception as exc:
+            logger.exception("[payment] ProbePlusTrial crashed")
+            return payment_pb2.ProbePlusTrialPaymentResponse(success=False, error_message=str(exc)[:500])
+        finally:
+            if cs_session is not None:
+                _close_session(cs_session)
 
     def StartGoPay(self, request, context):
         session_token = (request.session_token or "").strip()

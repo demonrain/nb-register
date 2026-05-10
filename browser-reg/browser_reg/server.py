@@ -88,13 +88,15 @@ class RegistrationFlow:
         return self._shutdown_event.is_set() or self._cancel_event.is_set()
 
     def _wait_for_otp(self, timeout: int = 60) -> str:
-        del timeout
+        deadline = time.time() + max(float(timeout or 0), 0)
         self.otp_issued_after_unix = int(time.time())
         self._otp_required_event.set()
         logger.info("[browser-reg] waiting orchestrator-supplied OTP flow=%s email=%s", self.flow_id, self.safe_email)
         while not self._otp_event.wait(0.25):
             if self._should_cancel():
                 raise RuntimeError("browser registration cancelled")
+            if timeout and time.time() >= deadline:
+                raise TimeoutError("OTP wait timed out")
 
         if self._should_cancel():
             raise RuntimeError("browser registration cancelled")
@@ -184,6 +186,7 @@ class BrowserRegistrationServicer(browser_pb2_grpc.BrowserRegistrationServicer):
             device_id=result.get("device_id", ""),
             plus_trial_eligible=bool(result.get("plus_trial", False)),
             checkout_url=result.get("checkout_url", ""),
+            plus_trial_checked=bool(result.get("plus_trial_checked", False)),
         )
 
     def StartRegister(self, request, context):

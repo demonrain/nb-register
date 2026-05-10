@@ -1,4 +1,5 @@
 camoufox[geoip]
+faker
 grpcio
 grpcio-tools
 maxminddb

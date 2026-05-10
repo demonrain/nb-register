@@ -21,15 +21,40 @@ Returns: {email, password, session_token, access_token, device_id, cookie_header
 
 import os
 import random
+import re
 import time
 import logging
 import tempfile
 import shutil
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from browser_reg.sensitive import redact_email, sanitize_text, sanitize_url_for_log
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_STRIPE_PK = (
+    "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRac"
+    "ViovU3kLKvpkjh7IqkW00iXQsjo3n"
+)
+
+_CHECKOUT_AMOUNT_KEYS = {
+    "due",
+    "amount_due",
+    "amount_total",
+    "total_amount",
+    "amount_remaining",
+    "total",
+}
+_CHECKOUT_AMOUNT_EXCLUDED_PATH_PARTS = {
+    "line_items",
+    "items",
+    "prices",
+    "price",
+    "unit_amount",
+    "unit_amount_decimal",
+    "tax_amount",
+    "discount_amount",
+}
 
 
 class BrowserRegistrationCancelled(RuntimeError):
@@ -44,6 +69,85 @@ def _interruptible_sleep(seconds: float, check_cancel: Callable[[], None]) -> No
         if remaining <= 0:
             return
         time.sleep(min(0.25, remaining))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+def _parse_checkout_amount(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = str(value).strip()
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return None
+
+
+def _path_has_amount_exclusion(path: tuple[str, ...]) -> bool:
+    return any(part.lower() in _CHECKOUT_AMOUNT_EXCLUDED_PATH_PARTS for part in path)
+
+
+def _iter_checkout_amount_candidates(value: Any, path: tuple[str, ...] = ()):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            child_path = path + (key_text,)
+            if key_text.lower() in _CHECKOUT_AMOUNT_KEYS and not _path_has_amount_exclusion(child_path):
+                amount = _parse_checkout_amount(child)
+                if amount is not None:
+                    yield ".".join(child_path), amount
+            if isinstance(child, (dict, list)):
+                yield from _iter_checkout_amount_candidates(child, child_path)
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            if isinstance(child, (dict, list)):
+                yield from _iter_checkout_amount_candidates(child, path + (str(idx),))
+
+
+def _select_checkout_amount(payload: dict) -> tuple[Optional[int], str]:
+    candidates = list(_iter_checkout_amount_candidates(payload))
+    if not candidates:
+        return None, "unknown"
+
+    preferred_keys = (
+        "due",
+        "amount_due",
+        "amount_total",
+        "total_amount",
+        "amount_remaining",
+        "total",
+    )
+    preferred_contexts = ("total_summary", "invoice", "checkout", "session", "subscription")
+    for key in preferred_keys:
+        for source, amount in candidates:
+            parts = tuple(source.lower().split("."))
+            if parts[-1] == key and any(ctx in parts for ctx in preferred_contexts):
+                return amount, source
+    return candidates[0][1], candidates[0][0]
+
+
+def _trial_probe_currency(info: dict) -> str:
+    init_data = info.get("stripe_init") if isinstance(info, dict) else {}
+    checkout_data = info.get("checkout_data") if isinstance(info, dict) else {}
+    if not isinstance(init_data, dict):
+        init_data = {}
+    if not isinstance(checkout_data, dict):
+        checkout_data = {}
+    invoice = init_data.get("invoice") if isinstance(init_data.get("invoice"), dict) else {}
+    total_summary = init_data.get("total_summary") if isinstance(init_data.get("total_summary"), dict) else {}
+    return str(
+        init_data.get("currency")
+        or invoice.get("currency")
+        or total_summary.get("currency")
+        or checkout_data.get("currency")
+        or ""
+    ).upper()
 
 
 def cleanup_stale_browser_profiles(max_age_seconds: float = 4 * 3600) -> int:
@@ -163,6 +267,10 @@ def browser_register(
         "csrf_token": "",
         "cookie_header": "",
         "plus_trial": False,
+        "plus_trial_checked": False,
+        "plus_trial_amount": 0,
+        "plus_trial_currency": "",
+        "plus_trial_source": "",
         "checkout_url": "",
     }
 
@@ -390,13 +498,42 @@ def browser_register(
             logger.info(f"[browser-reg] Post-password URL: {sanitize_url_for_log(page.url)}")
 
             # --- [5] Second OTP (after password, for email verification) ---
+            def _is_email_code_page() -> bool:
+                if "auth.openai.com/email-verification" not in page.url:
+                    return False
+                try:
+                    body_text = page.locator("body").inner_text(timeout=1000).lower()
+                except Exception:
+                    body_text = ""
+                return (
+                    "check your inbox" in body_text
+                    or "verification code" in body_text
+                    or "enter the verification code" in body_text
+                )
+
+            def _find_otp_input():
+                for sel in [
+                    'input[autocomplete="one-time-code"]:visible',
+                    'input[name="code"]:visible',
+                    'input[inputmode="numeric"]:visible',
+                    'input[aria-label*="code" i]:visible',
+                    'input[placeholder*="code" i]:visible',
+                    'input[type="text"]:visible',
+                    'input:not([type="hidden"]):not([type="password"]):visible',
+                ]:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            return el
+                    except Exception:
+                        continue
+                return None
+
             # Wait for OTP page to appear
             for wait_i in range(30):
                 sleep(1)
                 try:
-                    if (page.query_selector('input[autocomplete="one-time-code"]')
-                            or page.query_selector('input[name="code"]')
-                            or page.query_selector('input[inputmode="numeric"]')):
+                    if _find_otp_input() or _is_email_code_page():
                         logger.info("[browser-reg] Second OTP page reached")
                         break
                     if "chatgpt.com" in page.url and "auth.openai.com" not in page.url:
@@ -409,8 +546,7 @@ def browser_register(
                 if wait_i == 15:
                     page.screenshot(path=f"{screenshot_dir}/wait_otp2.png")
 
-            if (page.query_selector('input[autocomplete="one-time-code"]')
-                    or page.query_selector('input[inputmode="numeric"]')):
+            if _find_otp_input() or _is_email_code_page():
                 logger.info("[browser-reg] Waiting for second OTP ...")
                 on_status_change_fn("WAITING_FOR_OTP")
                 otp_code = None
@@ -448,9 +584,7 @@ def browser_register(
                 logger.info("[browser-reg] Got OTP")
 
                 otp_filled = False
-                single = (page.query_selector('input[autocomplete="one-time-code"]')
-                          or page.query_selector('input[name="code"]')
-                          or page.query_selector('input[inputmode="numeric"]:not([maxlength="1"])'))
+                single = _find_otp_input()
                 if single:
                     single.click()
                     sleep(0.3)
@@ -709,43 +843,156 @@ def browser_register(
                 f"device_id={'yes' if result['device_id'] else 'no'}"
             )
 
-            # --- [10] Plus Trial Eligibility Check ---
-            if result["access_token"]:
+            # --- [10] Optional Plus Trial Eligibility Check ---
+            if result["access_token"] and _env_bool("BROWSER_CHECK_PLUS_TRIAL", False):
                 try:
-                    trial_info = page.evaluate('''async (token) => {
+                    stripe_pk = (os.environ.get("STRIPE_PUBLISHABLE_KEY") or DEFAULT_STRIPE_PK).strip()
+                    trial_info = page.evaluate('''async ({token, stripePk, deviceId}) => {
                         try {
                             const resp = await fetch('/backend-api/payments/checkout', {
                                 method: 'POST',
+                                credentials: 'include',
                                 headers: {
                                     'Authorization': 'Bearer ' + token,
-                                    'Content-Type': 'application/json'
+                                    'Content-Type': 'application/json',
+                                    'oai-device-id': deviceId || '',
+                                    'oai-language': 'en-US',
+                                    'x-openai-target-path': '/backend-api/payments/checkout',
+                                    'x-openai-target-route': '/backend-api/payments/checkout'
                                 },
                                 body: JSON.stringify({
+                                    entry_point: 'all_plans_pricing_modal',
                                     plan_name: 'chatgptplusplan',
                                     billing_details: { country: 'ID', currency: 'IDR' },
                                     promo_campaign: {
                                         promo_campaign_id: 'plus-1-month-free',
                                         is_coupon_from_query_param: false
                                     },
-                                    checkout_ui_mode: 'hosted'
+                                    checkout_ui_mode: 'hosted',
+                                    cancel_url: 'https://chatgpt.com/#pricing'
                                 })
                             });
-                            const data = await resp.json();
+                            const data = await resp.json().catch(() => ({}));
+                            const rawUrl = data?.url || data?.stripe_hosted_url || data?.checkout_url || '';
+                            let checkoutSessionId = data?.checkout_session_id || data?.session_id || data?.id || '';
+                            if (!checkoutSessionId && rawUrl) {
+                                const match = String(rawUrl).match(/(cs_(?:live|test)_[A-Za-z0-9]+)/);
+                                checkoutSessionId = match ? match[1] : '';
+                            }
+                            const processorEntity = data?.processor_entity || data?.processor || 'openai_llc';
+                            const checkoutUrl = rawUrl || (checkoutSessionId ? `https://chatgpt.com/checkout/${processorEntity}/${checkoutSessionId}` : '');
+                            let stripeStatus = 0;
+                            let stripeInit = {};
+                            let stripeError = '';
+                            if (checkoutSessionId) {
+                                const stripeJsId = (globalThis.crypto && crypto.randomUUID)
+                                    ? crypto.randomUUID()
+                                    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+                                const body = new URLSearchParams({
+                                    browser_locale: 'en-US',
+                                    browser_timezone: 'Asia/Shanghai',
+                                    'elements_session_client[client_betas][0]': 'custom_checkout_server_updates_1',
+                                    'elements_session_client[client_betas][1]': 'custom_checkout_manual_approval_1',
+                                    'elements_session_client[elements_init_source]': 'custom_checkout',
+                                    'elements_session_client[referrer_host]': 'chatgpt.com',
+                                    'elements_session_client[stripe_js_id]': stripeJsId,
+                                    'elements_session_client[locale]': 'en',
+                                    'elements_session_client[is_aggregation_expected]': 'false',
+                                    'elements_options_client[stripe_js_locale]': 'auto',
+                                    key: stripePk
+                                });
+                                const initResp = await fetch(`https://api.stripe.com/v1/payment_pages/${checkoutSessionId}/init`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body
+                                });
+                                stripeStatus = initResp.status;
+                                stripeInit = await initResp.json().catch(() => ({}));
+                                if (!initResp.ok) {
+                                    stripeError = JSON.stringify(stripeInit).slice(0, 300);
+                                }
+                            }
                             return {
                                 status: resp.status,
-                                url: data?.url || data?.stripe_hosted_url || data?.checkout_url || null
+                                url: checkoutUrl,
+                                checkout_session_id: checkoutSessionId,
+                                processor_entity: processorEntity,
+                                checkout_data: {
+                                    currency: data?.currency || data?.billing_details?.currency || '',
+                                    amount_due: data?.amount_due,
+                                    amount_total: data?.amount_total,
+                                    total_amount: data?.total_amount,
+                                    total: data?.total
+                                },
+                                stripe_status: stripeStatus,
+                                stripe_error: stripeError,
+                                stripe_init: {
+                                    currency: stripeInit?.currency || stripeInit?.invoice?.currency || '',
+                                    total_summary: stripeInit?.total_summary || null,
+                                    invoice: stripeInit?.invoice || null,
+                                    checkout_session: stripeInit?.checkout_session || null,
+                                    subscription: stripeInit?.subscription || null,
+                                    amount_due: stripeInit?.amount_due,
+                                    amount_total: stripeInit?.amount_total,
+                                    total_amount: stripeInit?.total_amount,
+                                    amount_remaining: stripeInit?.amount_remaining,
+                                    total: stripeInit?.total
+                                }
                             };
-                        } catch(e) { return { status: -1, url: null }; }
-                    }''', result["access_token"])
+                        } catch(e) { return { status: -1, url: null, error: String(e && e.message || e) }; }
+                    }''', {
+                        "token": result["access_token"],
+                        "stripePk": stripe_pk,
+                        "deviceId": result["device_id"],
+                    })
                     checkout_url = trial_info.get("url", "") or ""
-                    result["plus_trial"] = bool(checkout_url)
                     result["checkout_url"] = checkout_url
-                    logger.info(
-                        f"[browser-reg] Plus trial: {result['plus_trial']} "
-                        f"(status={trial_info.get('status')}, url={'yes' if checkout_url else 'no'})"
-                    )
+                    amount, source = _select_checkout_amount(trial_info.get("stripe_init") or {})
+                    if amount is None:
+                        checkout_amount, checkout_source = _select_checkout_amount(trial_info.get("checkout_data") or {})
+                        if checkout_amount is not None:
+                            amount, source = checkout_amount, f"checkout_data.{checkout_source}"
+                    if amount is None:
+                        probe_error = sanitize_text(
+                            trial_info.get("error") or trial_info.get("stripe_error") or ""
+                        )
+                        probe_message = (
+                            "[browser-reg] Plus trial probe did not expose amount "
+                            f"(checkout_status={trial_info.get('status')}, "
+                            f"stripe_status={trial_info.get('stripe_status')}, "
+                            f"url={'yes' if checkout_url else 'no'}, "
+                            f"error={probe_error})"
+                        )
+                        if (
+                            trial_info.get("stripe_status") == 403
+                            and "invalid_request_http_origin" in probe_error
+                            and checkout_url
+                        ):
+                            logger.info(
+                                probe_message
+                                + "; Stripe init is blocked by browser Origin, "
+                                + "GoPay payment flow will validate amount"
+                            )
+                        else:
+                            logger.warning(probe_message)
+                    else:
+                        result["plus_trial_checked"] = True
+                        result["plus_trial_amount"] = amount
+                        result["plus_trial_currency"] = _trial_probe_currency(trial_info)
+                        result["plus_trial_source"] = source
+                        result["plus_trial"] = amount == 0
+                        logger.info(
+                            f"[browser-reg] Plus trial eligible={result['plus_trial']} "
+                            f"amount={amount} {result['plus_trial_currency'] or '?'} "
+                            f"source={source} url={'yes' if checkout_url else 'no'}"
+                        )
                 except Exception as e:
                     logger.warning(f"[browser-reg] Plus trial check failed: {sanitize_text(e)}")
+            else:
+                logger.info(
+                    "[browser-reg] Plus trial checkout probe disabled; "
+                    "account eligibility remains unknown until payment validation"
+                )
 
             # --- [11] Validation ---
             if not result["access_token"] or not result["session_token"]:

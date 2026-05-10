@@ -2,13 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,23 +18,18 @@ import (
 	"accountdb/pb"
 )
 
-const outlookAliasAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-
 type accountDatabaseServer struct {
 	pb.UnimplementedAccountDatabaseServiceServer
 	db *gorm.DB
 }
 
-type outlookAliasConfig struct {
-	LocalPart   string
-	Domain      string
-	TokenLength int
-}
-
 func (s *accountDatabaseServer) CreateAccount(ctx context.Context, req *pb.CreateAccountRequest) (*pb.CreateAccountResponse, error) {
-	account, err := s.buildAccount(ctx, req.GetAccount())
+	account, err := s.buildAccount(req.GetAccount())
 	if err != nil {
 		return nil, err
+	}
+	if account.Email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email is required")
 	}
 
 	if err := s.db.WithContext(ctx).Create(account).Error; err != nil {
@@ -124,7 +115,7 @@ func (s *accountDatabaseServer) ListAccounts(ctx context.Context, req *pb.ListAc
 	return resp, nil
 }
 
-func (s *accountDatabaseServer) buildAccount(ctx context.Context, input *pb.Account) (*db.Account, error) {
+func (s *accountDatabaseServer) buildAccount(input *pb.Account) (*db.Account, error) {
 	if input == nil {
 		input = &pb.Account{}
 	}
@@ -143,17 +134,15 @@ func (s *accountDatabaseServer) buildAccount(ctx context.Context, input *pb.Acco
 		LastName:     strings.TrimSpace(input.GetLastName()),
 		DOB:          strings.TrimSpace(input.GetDob()),
 	}
+	if input.PlusTrialEligible != nil {
+		value := input.GetPlusTrialEligible()
+		account.PlusTrialEligible = &value
+	}
 
 	if account.ID == "" {
 		account.ID = gofakeit.UUID()
 	}
-	if account.Email == "" {
-		email, err := s.nextOutlookAlias(ctx)
-		if err != nil {
-			return nil, err
-		}
-		account.Email = email
-	}
+	account.Email = normalizeEmail(account.Email)
 	if account.Password == "" {
 		account.Password = gofakeit.Password(true, true, true, true, false, 12)
 	}
@@ -171,38 +160,6 @@ func (s *accountDatabaseServer) buildAccount(ctx context.Context, input *pb.Acco
 	}
 
 	return account, nil
-}
-
-func (s *accountDatabaseServer) nextOutlookAlias(ctx context.Context) (string, error) {
-	cfg, err := loadOutlookAliasConfig()
-	if err != nil {
-		return "", err
-	}
-
-	var emails []string
-	if err := s.db.WithContext(ctx).Model(&db.Account{}).
-		Where("email <> ''").
-		Pluck("email", &emails).Error; err != nil {
-		return "", err
-	}
-
-	used := make(map[string]bool, len(emails))
-	for _, email := range emails {
-		used[strings.ToLower(strings.TrimSpace(email))] = true
-	}
-
-	for attempt := 0; attempt < 100; attempt++ {
-		token, err := randomAliasToken(cfg.TokenLength)
-		if err != nil {
-			return "", err
-		}
-		email := fmt.Sprintf("%s+%s@%s", cfg.LocalPart, token, cfg.Domain)
-		if !used[email] {
-			return email, nil
-		}
-	}
-
-	return "", status.Error(codes.ResourceExhausted, "failed to generate unique Outlook alias")
 }
 
 func (s *accountDatabaseServer) findAccount(ctx context.Context, accountID string) (*db.Account, error) {
@@ -228,7 +185,7 @@ func updateMap(account *pb.Account) map[string]interface{} {
 		return updates
 	}
 
-	if value := strings.TrimSpace(account.GetEmail()); value != "" {
+	if value := normalizeEmail(account.GetEmail()); value != "" {
 		updates["email"] = value
 	}
 	if value := account.GetPassword(); value != "" {
@@ -258,6 +215,9 @@ func updateMap(account *pb.Account) map[string]interface{} {
 	if value := strings.TrimSpace(account.GetDob()); value != "" {
 		updates["dob"] = value
 	}
+	if account.PlusTrialEligible != nil {
+		updates["plus_trial_eligible"] = account.GetPlusTrialEligible()
+	}
 	return updates
 }
 
@@ -266,66 +226,21 @@ func accountToProto(account *db.Account) *pb.Account {
 		return nil
 	}
 	return &pb.Account{
-		AccountId:    account.ID,
-		Email:        account.Email,
-		Password:     account.Password,
-		Status:       account.Status,
-		ErrorMessage: account.ErrorMessage,
-		SessionToken: account.SessionToken,
-		AccessToken:  account.AccessToken,
-		ChargeRef:    account.ChargeRef,
-		FirstName:    account.FirstName,
-		LastName:     account.LastName,
-		Dob:          account.DOB,
-		CreatedAt:    account.CreatedAt,
-		UpdatedAt:    account.UpdatedAt,
+		AccountId:         account.ID,
+		Email:             account.Email,
+		Password:          account.Password,
+		Status:            account.Status,
+		ErrorMessage:      account.ErrorMessage,
+		SessionToken:      account.SessionToken,
+		AccessToken:       account.AccessToken,
+		ChargeRef:         account.ChargeRef,
+		FirstName:         account.FirstName,
+		LastName:          account.LastName,
+		Dob:               account.DOB,
+		CreatedAt:         account.CreatedAt,
+		UpdatedAt:         account.UpdatedAt,
+		PlusTrialEligible: account.PlusTrialEligible,
 	}
-}
-
-func loadOutlookAliasConfig() (*outlookAliasConfig, error) {
-	primary := strings.TrimSpace(os.Getenv("OUTLOOK_EMAIL"))
-	if primary == "" {
-		primary = strings.TrimSpace(os.Getenv("OUTLOOK_PRIMARY_EMAIL"))
-	}
-	if primary == "" {
-		return nil, status.Error(codes.FailedPrecondition, "OUTLOOK_EMAIL is required when email is not specified")
-	}
-
-	parts := strings.Split(primary, "@")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, status.Error(codes.FailedPrecondition, "invalid OUTLOOK_EMAIL")
-	}
-
-	tokenLength := 6
-	if raw := strings.TrimSpace(os.Getenv("OUTLOOK_ALIAS_RANDOM_LENGTH")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 32 {
-			return nil, status.Errorf(codes.FailedPrecondition, "invalid OUTLOOK_ALIAS_RANDOM_LENGTH: %q", raw)
-		}
-		tokenLength = n
-	}
-
-	return &outlookAliasConfig{
-		LocalPart:   strings.ToLower(parts[0]),
-		Domain:      strings.ToLower(parts[1]),
-		TokenLength: tokenLength,
-	}, nil
-}
-
-func randomAliasToken(length int) (string, error) {
-	var b strings.Builder
-	b.Grow(length)
-	max := big.NewInt(int64(len(outlookAliasAlphabet)))
-
-	for i := 0; i < length; i++ {
-		n, err := rand.Int(rand.Reader, max)
-		if err != nil {
-			return "", err
-		}
-		b.WriteByte(outlookAliasAlphabet[n.Int64()])
-	}
-
-	return b.String(), nil
 }
 
 func envDefault(key string, fallback string) string {
@@ -353,6 +268,10 @@ func redactEmail(email string) string {
 		local = local[:2]
 	}
 	return local + "***@" + parts[1]
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 func main() {

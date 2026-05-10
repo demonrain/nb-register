@@ -1,4 +1,5 @@
 tokens/
+register-results/
 .env
 .env.*
 *.token
@@ -6,6 +7,10 @@ tokens/
 *.pem
 *.key
 *.log
+*_pb2.py
+*_pb2_grpc.py
+**/*_pb2.py
+**/*_pb2_grpc.py
 outlook-imap-service
 *.test
 *.out

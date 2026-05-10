@@ -10,19 +10,20 @@ import (
 )
 
 type Account struct {
-	ID           string `gorm:"primaryKey"`
-	Email        string `gorm:"uniqueIndex"`
-	Password     string
-	Status       string
-	ErrorMessage string
-	SessionToken string
-	AccessToken  string
-	ChargeRef    string
-	FirstName    string
-	LastName     string
-	DOB          string // YYYY-MM-DD
-	CreatedAt    int64  `gorm:"autoCreateTime"`
-	UpdatedAt    int64  `gorm:"autoUpdateTime"`
+	ID                string `gorm:"primaryKey"`
+	Email             string `gorm:"uniqueIndex"`
+	Password          string
+	Status            string
+	ErrorMessage      string
+	SessionToken      string
+	AccessToken       string
+	ChargeRef         string
+	FirstName         string
+	LastName          string
+	DOB               string // YYYY-MM-DD
+	PlusTrialEligible *bool
+	CreatedAt         int64 `gorm:"autoCreateTime"`
+	UpdatedAt         int64 `gorm:"autoUpdateTime"`
 }
 
 func InitDB() *gorm.DB {

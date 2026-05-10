@@ -17,7 +17,7 @@ button, input, select { font: inherit; }
   height: 100%;
   padding: 22px;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -98,9 +98,84 @@ input, select {
 .toast.ok { color: #174f3b; }
 .toast.error { color: #a1372f; }
 
+.appFrame {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 172px minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
+}
+
+.navRail {
+  min-height: 0;
+  border: 1px solid #d6ddd5;
+  background: #fbfcfb;
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.navItem {
+  min-height: 42px;
+  width: 100%;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border-color: transparent;
+  background: transparent;
+  text-align: left;
+}
+
+.navItem span {
+  display: inline-flex;
+  color: #5b675f;
+}
+
+.navItem strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.navItem em {
+  min-width: 26px;
+  min-height: 22px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #eef3ef;
+  color: #607069;
+  font-size: 12px;
+  font-style: normal;
+  text-align: center;
+}
+
+.navItem.active {
+  border-color: #c8d7ce;
+  background: #eef6f1;
+}
+
+.navItem.active span,
+.navItem.active strong {
+  color: #174f3b;
+}
+
+.contentPane {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -121,11 +196,20 @@ input, select {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(360px, .8fr);
   grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   min-height: 0;
   overflow: hidden;
+}
+
+.accountsWorkspace {
+  grid-template-columns: minmax(0, 1fr) minmax(330px, .42fr);
+}
+
+.mailboxWorkspace,
+.mailboxRegistrationWorkspace,
+.jobsWorkspace {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .panel {
@@ -139,7 +223,20 @@ input, select {
 }
 
 .accountsPanel { grid-column: 1; }
-.jobsPanel { grid-column: 2; }
+
+.compactPanel table {
+  min-width: 520px;
+}
+
+.sideStack {
+  grid-column: 2;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) minmax(240px, .72fr);
+  gap: 12px;
+  overflow: hidden;
+}
 
 .panelHeader {
   justify-content: space-between;
@@ -189,6 +286,40 @@ input, select {
   padding: 0;
 }
 
+.mailboxForm {
+  padding: 12px 14px;
+  border-bottom: 1px solid #e0e5df;
+  display: grid;
+  grid-template-columns: minmax(160px, 1.3fr) minmax(140px, .9fr) minmax(180px, 1fr) minmax(180px, 1fr) 150px 92px;
+  gap: 8px;
+}
+
+.mailboxForm button {
+  justify-content: center;
+}
+
+.mailboxRegisterBody {
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.mailboxRegisterBody .sectionTitle {
+  padding: 12px 14px 0;
+  margin-bottom: 8px;
+}
+
+.mailboxRegisterBody .tableWrap {
+  min-height: 0;
+}
+
+.mailboxRegisterBody .oauthTableWrap {
+  flex: 0 0 auto;
+  max-height: 260px;
+  border-bottom: 1px solid #e0e5df;
+}
+
 .tableWrap {
   overflow: auto;
   flex: 1;
@@ -202,7 +333,36 @@ table {
   font-size: 13px;
 }
 
-.accountsPanel table { min-width: 860px; }
+.accountsPanel table { min-width: 920px; }
+.mailboxesPanel table { min-width: 920px; }
+
+.mailboxStatusStrip {
+  padding: 12px 14px;
+  border-bottom: 1px solid #e0e5df;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mailboxStatusStrip div {
+  min-height: 48px;
+  border: 1px solid #dce3dc;
+  background: #f6f8f5;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 3px;
+}
+
+.mailboxStatusStrip strong {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.mailboxStatusStrip span {
+  color: #68736b;
+  font-size: 12px;
+}
 
 th {
   text-align: left;
@@ -286,6 +446,12 @@ tbody tr:hover, tr.selected { background: #eef6f1; }
   width: 30px;
   min-height: 30px;
   padding: 0;
+  justify-content: center;
+}
+
+.rowButton {
+  min-height: 30px;
+  padding: 5px 9px;
   justify-content: center;
 }
 
@@ -404,14 +570,14 @@ tbody tr:hover, tr.selected { background: #eef6f1; }
 
 .kv {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
+  grid-template-columns: 96px minmax(0, 1fr) 34px;
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
   font-size: 13px;
 }
 .kv span { color: #647069; }
-.kv button {
+.valueButton {
   justify-content: flex-start;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -420,14 +586,50 @@ tbody tr:hover, tr.selected { background: #eef6f1; }
 
 .editLine {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) 78px;
+  grid-template-columns: 96px minmax(0, 1fr) 34px 78px;
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
   font-size: 13px;
 }
 .editLine span { color: #647069; }
-.editLine button {
+.editLine button,
+.copyButton {
+  justify-content: center;
+}
+
+.copyButton {
+  width: 34px;
+  min-width: 34px;
+  padding: 7px;
+}
+
+.otpSubmitter {
+  margin: 12px 0 14px;
+  padding: 10px;
+  border: 1px solid #dce3dc;
+  background: #f6f8f5;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.otpSubmitter span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #47544c;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.otpSubmitter > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px;
+  gap: 8px;
+}
+
+.otpSubmitter button {
   justify-content: center;
 }
 
@@ -473,16 +675,38 @@ pre {
     grid-template-rows: auto;
     overflow: visible;
   }
-  .accountsPanel, .jobsPanel { grid-column: 1; grid-row: auto; }
+  .appFrame {
+    grid-template-columns: 1fr;
+    overflow: visible;
+  }
+  .contentPane {
+    overflow: visible;
+  }
+  .navRail {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+  .navItem {
+    width: auto;
+    min-width: 150px;
+  }
+  .accountsPanel, .sideStack { grid-column: 1; grid-row: auto; }
+  .sideStack {
+    grid-template-rows: auto;
+    overflow: visible;
+  }
   .panel { min-height: 320px; }
   .details { grid-template-columns: 1fr; }
+  .mailboxForm { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 640px) {
   .shell { padding: 14px; }
   .topbar { align-items: flex-start; flex-direction: column; }
   .metrics { grid-template-columns: 1fr; }
+  .mailboxStatusStrip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .createAccount,
+  .mailboxForm,
   .createAccount .formGrid { grid-template-columns: 1fr; }
   th, td { padding: 9px; }
 }

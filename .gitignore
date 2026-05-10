@@ -66,6 +66,12 @@ coverage/
 go.work
 go.work.sum
 
+# Generated protobuf bindings
+**/pb/*.pb.go
+**/pb/*_grpc.pb.go
+**/*_pb2.py
+**/*_pb2_grpc.py
+
 # OS
 .DS_Store
 .DS_Store?
@@ -82,6 +88,10 @@ browser-reg/.venv/
 browser-reg/register_pb2.py
 browser-reg/register_pb2_grpc.py
 /tmp/screenshots/
+outlook-imap-service/register-results/
+outlook-imap-service/local_test/
+outlook-register-service/register-results/
+.tmp_outlook_register/
 __pycache__/
 *.pyc
 .pytest_cache/

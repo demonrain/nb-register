@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -24,8 +27,11 @@ import (
 type server struct {
 	accountClient      pb.AccountDatabaseServiceClient
 	orchestratorClient pb.OrchestratorServiceClient
+	emailClient        pb.EmailServiceClient
 	db                 *sql.DB
 	staticDir          string
+	mailboxRegisterMu  sync.Mutex
+	mailboxRegistering bool
 }
 
 type jobRow struct {
@@ -62,6 +68,26 @@ type createAccountRequest struct {
 	Password string `json:"password"`
 }
 
+type upsertMailboxRequest struct {
+	MailboxID    string `json:"mailbox_id"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	Status       string `json:"status"`
+	LastError    string `json:"last_error"`
+}
+
+type mailboxOAuthRequest struct {
+	EmailAddress string `json:"email_address"`
+	OnlyMissing  bool   `json:"only_missing"`
+	Limit        int32  `json:"limit"`
+}
+
+type submitJobOTPRequest struct {
+	OTP string `json:"otp"`
+}
+
 type updateAccountRequest struct {
 	SessionToken string `json:"session_token"`
 	AccessToken  string `json:"access_token"`
@@ -82,6 +108,12 @@ func main() {
 	}
 	defer orchestratorConn.Close()
 
+	emailConn, err := grpc.NewClient(envDefault("EMAIL_ADDR", "outlook-imap-service:50051"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("connect email service: %v", err)
+	}
+	defer emailConn.Close()
+
 	pg, err := sql.Open("pgx", envDefault("ORCHESTRATOR_PG_DSN", envDefault("PG_DSN", "")))
 	if err != nil {
 		log.Fatalf("open postgres: %v", err)
@@ -94,6 +126,7 @@ func main() {
 	s := &server{
 		accountClient:      pb.NewAccountDatabaseServiceClient(accountConn),
 		orchestratorClient: pb.NewOrchestratorServiceClient(orchestratorConn),
+		emailClient:        pb.NewEmailServiceClient(emailConn),
 		db:                 pg,
 		staticDir:          envDefault("STATIC_DIR", "web/dist"),
 	}
@@ -102,10 +135,14 @@ func main() {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/", s.handleAccount)
+	mux.HandleFunc("/api/mailboxes/register", s.handleMailboxRegister)
+	mux.HandleFunc("/api/mailboxes/oauth", s.handleMailboxOAuth)
+	mux.HandleFunc("/api/mailboxes", s.handleMailboxes)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
 	mux.HandleFunc("/api/jobs/", s.handleJob)
 	mux.HandleFunc("/api/workflows/register", s.handleRegister)
 	mux.HandleFunc("/api/workflows/activate", s.handleActivate)
+	mux.HandleFunc("/api/workflows/probe-plus-trial", s.handleProbePlusTrial)
 	mux.HandleFunc("/api/workflows/register-and-activate", s.handleRegisterAndActivate)
 	mux.HandleFunc("/", s.handleStatic)
 
@@ -143,9 +180,20 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		accountID := randomID()
+		email := strings.TrimSpace(req.Email)
+		if email == "" {
+			emailResp, err := s.emailClient.GetEmail(r.Context(), &pb.GetEmailRequest{})
+			if err != nil {
+				writeError(w, http.StatusBadGateway, err)
+				return
+			}
+			email = emailResp.GetEmailAddress()
+		}
 		resp, err := s.accountClient.CreateAccount(r.Context(), &pb.CreateAccountRequest{Account: &pb.Account{
-			Email:    req.Email,
-			Password: req.Password,
+			AccountId: accountID,
+			Email:     email,
+			Password:  req.Password,
 		}})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
@@ -155,6 +203,131 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *server) handleMailboxes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := int32(queryInt(r, "limit", 100))
+		resp, err := s.emailClient.ListMailboxes(r.Context(), &pb.ListEmailMailboxesRequest{
+			Status: r.URL.Query().Get("status"),
+			Limit:  limit,
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		mailboxes := resp.GetMailboxes()
+		if mailboxes == nil {
+			mailboxes = []*pb.EmailMailbox{}
+		}
+		writeJSON(w, http.StatusOK, mailboxes)
+	case http.MethodPost:
+		var req upsertMailboxRequest
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		resp, err := s.emailClient.UpsertMailbox(r.Context(), &pb.UpsertEmailMailboxRequest{Mailbox: &pb.EmailMailbox{
+			EmailAddress: req.Email,
+			Password:     req.Password,
+			RefreshToken: req.RefreshToken,
+			AccessToken:  req.AccessToken,
+			Status:       req.Status,
+			LastError:    req.LastError,
+			IsPrimary:    true,
+			PrimaryEmail: req.Email,
+		}})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp.GetMailbox())
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) handleMailboxRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mailboxRegisterMu.Lock()
+	if s.mailboxRegistering {
+		s.mailboxRegisterMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("mailbox registration is already running"))
+		return
+	}
+	s.mailboxRegistering = true
+	s.mailboxRegisterMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.mailboxRegisterMu.Lock()
+			s.mailboxRegistering = false
+			s.mailboxRegisterMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(envInt("MAILBOX_REGISTER_TIMEOUT_SECONDS", 1800))*time.Second)
+		defer cancel()
+		resp, err := s.orchestratorClient.RegisterMailbox(ctx, &pb.RegisterMailboxRequest{})
+		if err != nil {
+			log.Printf("mailbox registration workflow failed to start: %v", err)
+			return
+		}
+		if resp.GetErrorMessage() != "" {
+			log.Printf("mailbox registration workflow job=%s failed: %s", resp.GetJobId(), resp.GetErrorMessage())
+			return
+		}
+		log.Printf("mailbox registration workflow job=%s completed success=%v exit_code=%d", resp.GetJobId(), resp.GetSuccess(), resp.GetExitCode())
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"started": true,
+		"backend": "outlook-register-service",
+	})
+}
+
+func (s *server) handleMailboxOAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req mailboxOAuthRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+	if strings.TrimSpace(req.EmailAddress) == "" {
+		req.OnlyMissing = true
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := s.orchestratorClient.RunMailboxOAuth(ctx, &pb.StartMailboxOAuthRequest{
+		EmailAddress: strings.TrimSpace(req.EmailAddress),
+		OnlyMissing:  req.OnlyMissing,
+		Limit:        req.Limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	statusCode := http.StatusAccepted
+	if !resp.GetStarted() || resp.GetErrorMessage() != "" {
+		statusCode = http.StatusBadGateway
+	}
+	writeJSON(w, statusCode, map[string]any{
+		"started":       resp.GetStarted(),
+		"job_id":        resp.GetJobId(),
+		"error_message": resp.GetErrorMessage(),
+		"backend":       "outlook-register-service",
+	})
 }
 
 func (s *server) handleAccount(w http.ResponseWriter, r *http.Request) {
@@ -220,20 +393,34 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
-	jobID := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
-	jobID = strings.TrimSuffix(jobID, "/retry")
-	if jobID == "" {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
 		writeError(w, http.StatusBadRequest, errors.New("job_id is required"))
 		return
 	}
+	jobID := strings.TrimSpace(parts[0])
 
-	if strings.HasSuffix(r.URL.Path, "/retry") {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+	if len(parts) > 1 {
+		switch parts[1] {
+		case "retry":
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			s.retryJob(w, r, jobID)
+			return
+		case "otp":
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			s.submitJobOTP(w, r, jobID)
+			return
+		default:
+			writeError(w, http.StatusNotFound, fmt.Errorf("unsupported job action: %s", parts[1]))
 			return
 		}
-		s.retryJob(w, r, jobID)
-		return
 	}
 
 	if r.Method != http.MethodGet {
@@ -248,14 +435,36 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+func (s *server) submitJobOTP(w http.ResponseWriter, r *http.Request, jobID string) {
+	var req submitJobOTPRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	resp, err := s.orchestratorClient.SubmitRegistrationOtp(r.Context(), &pb.SubmitRegistrationOtpRequest{
+		JobId: jobID,
+		Otp:   req.OTP,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	if resp.GetErrorMessage() != "" {
+		writeError(w, http.StatusBadRequest, errors.New(resp.GetErrorMessage()))
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *server) retryJob(w http.ResponseWriter, r *http.Request, jobID string) {
 	job, err := s.getJob(r.Context(), jobID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	if job.Status == "RUNNING" {
-		writeError(w, http.StatusConflict, errors.New("running job cannot be retried"))
+	if !job.Retryable || !strings.HasPrefix(job.Status, "FAILED") {
+		writeError(w, http.StatusConflict, errors.New("only retryable failed jobs can be retried"))
 		return
 	}
 	if strings.TrimSpace(job.AccountID) == "" {
@@ -273,6 +482,13 @@ func (s *server) retryJob(w http.ResponseWriter, r *http.Request, jobID string) 
 		writeJSON(w, http.StatusOK, resp)
 	case "ACTIVATE":
 		resp, err := s.orchestratorClient.ActivateAccount(r.Context(), &pb.ActivateAccountRequest{AccountId: job.AccountID})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	case "PROBE_PLUS_TRIAL":
+		resp, err := s.orchestratorClient.ProbePlusTrial(r.Context(), &pb.ProbePlusTrialRequest{AccountId: job.AccountID})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return
@@ -324,6 +540,28 @@ func (s *server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *server) handleProbePlusTrial(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req pb.ProbePlusTrialRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp, err := s.orchestratorClient.ProbePlusTrial(r.Context(), &req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	statusCode := http.StatusAccepted
+	if !resp.GetStarted() || resp.GetErrorMessage() != "" {
+		statusCode = http.StatusBadGateway
+	}
+	writeJSON(w, statusCode, resp)
 }
 
 func (s *server) handleRegisterAndActivate(w http.ResponseWriter, r *http.Request) {
@@ -462,4 +700,31 @@ func envDefault(key string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func tailString(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[len(value)-limit:]
+}
+
+func randomID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }

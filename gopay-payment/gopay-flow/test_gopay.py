@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from gopay import (
     GoPayCharger,
@@ -7,6 +8,7 @@ from gopay import (
     _request_with_retries,
     _resolve_expected_amount,
     _stripe_confirm_error_detail,
+    probe_plus_trial_checkout,
 )
 
 
@@ -19,13 +21,35 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise GoPayError(f"http {self.status_code}: {self.text}")
+
 
 class FakeExt:
     def __init__(self, response):
         self.response = response
+        self.headers = {}
+        self.proxies = {}
 
     def post(self, *args, **kwargs):
         return self.response
+
+    def close(self):
+        pass
+
+
+class FakeChatGPTSession:
+    def __init__(self):
+        self.headers = {"User-Agent": "test-agent"}
+        self.proxies = {}
+        self.closed = False
+
+    def post(self, *args, **kwargs):
+        return FakeResponse(200, payload={"checkout_session_id": "cs_test_probe"})
+
+    def close(self):
+        self.closed = True
 
 
 class FlakySession:
@@ -124,6 +148,45 @@ class StripeExpectedAmountTests(unittest.TestCase):
 
         self.assertIn("sent expected_amount=0", detail)
         self.assertIn("another checkout", detail)
+
+
+class PlusTrialProbeTests(unittest.TestCase):
+    def test_probe_marks_zero_amount_eligible(self):
+        stripe_init = FakeResponse(
+            200,
+            payload={
+                "currency": "idr",
+                "init_checksum": "chk",
+                "payment_method_types": ["gopay"],
+                "checkout_session": {"amount_total": 0},
+            },
+        )
+
+        with patch("gopay._new_session", return_value=FakeExt(stripe_init)):
+            result = probe_plus_trial_checkout(FakeChatGPTSession(), log=lambda _msg: None)
+
+        self.assertTrue(result["checked"])
+        self.assertTrue(result["plus_trial_eligible"])
+        self.assertEqual(result["amount"], 0)
+        self.assertEqual(result["source"], "checkout_session.amount_total")
+
+    def test_probe_marks_nonzero_amount_ineligible(self):
+        stripe_init = FakeResponse(
+            200,
+            payload={
+                "currency": "idr",
+                "init_checksum": "chk",
+                "payment_method_types": ["gopay"],
+                "latest_invoice": {"amount_due": 319000},
+            },
+        )
+
+        with patch("gopay._new_session", return_value=FakeExt(stripe_init)):
+            result = probe_plus_trial_checkout(FakeChatGPTSession(), log=lambda _msg: None)
+
+        self.assertTrue(result["checked"])
+        self.assertFalse(result["plus_trial_eligible"])
+        self.assertEqual(result["amount"], 319000)
 
 
 if __name__ == "__main__":

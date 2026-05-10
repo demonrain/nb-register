@@ -1199,6 +1199,60 @@ def _select_checkout_amount(init_data: dict) -> tuple[Optional[int], str]:
     return candidates[0][1], candidates[0][0]
 
 
+def probe_plus_trial_checkout(
+    chatgpt_session: Any,
+    *,
+    stripe_pk: str = DEFAULT_STRIPE_PK,
+    runtime_cfg: Optional[dict] = None,
+    proxy: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Create a trial checkout and inspect Stripe amount without starting GoPay."""
+    charger = GoPayCharger(
+        chatgpt_session,
+        {"country_code": "0", "phone_number": "0", "pin": "0"},
+        otp_provider=lambda: (_ for _ in ()).throw(OTPCancelled("OTP not used by probe")),
+        proxy=proxy,
+        runtime_cfg=runtime_cfg,
+        log=log,
+    )
+    try:
+        try:
+            cs_id = charger._chatgpt_create_checkout()
+        except Exception as exc:
+            raise GoPayError(f"checkout create failed: {str(exc)[:500]}") from exc
+        checkout_url = f"https://checkout.stripe.com/c/pay/{cs_id}"
+        try:
+            init_data = charger._stripe_init(cs_id, stripe_pk)
+        except Exception as exc:
+            return {
+                "checkout_session_id": cs_id,
+                "checkout_url": checkout_url,
+                "checked": False,
+                "plus_trial_eligible": False,
+                "amount": 0,
+                "currency": "",
+                "source": "stripe_init_error",
+                "error_message": f"stripe init failed: {str(exc)[:500]}",
+            }
+
+        amount, source = _select_checkout_amount(init_data)
+        checked = amount is not None
+        error_message = "" if checked else "stripe init did not expose checkout amount"
+        return {
+            "checkout_session_id": cs_id,
+            "checkout_url": checkout_url,
+            "checked": checked,
+            "plus_trial_eligible": checked and amount == 0,
+            "amount": int(amount or 0),
+            "currency": str(init_data.get("currency") or "").upper(),
+            "source": source,
+            "error_message": error_message,
+        }
+    finally:
+        charger.close()
+
+
 def _resolve_expected_amount(init_data: dict, runtime_cfg: Optional[dict]) -> tuple[str, str]:
     runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
     override = runtime_cfg.get("expected_amount")

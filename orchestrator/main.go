@@ -27,7 +27,10 @@ import (
 const (
 	actionRegister            = "REGISTER"
 	actionActivate            = "ACTIVATE"
+	actionProbePlusTrial      = "PROBE_PLUS_TRIAL"
 	actionRegisterAndActivate = "REGISTER_AND_ACTIVATE"
+	actionRegisterMailbox     = "REGISTER_MAILBOX"
+	actionMailboxOAuth        = "MAILBOX_OAUTH"
 
 	statusCreated           = "CREATED"
 	statusRunning           = "RUNNING"
@@ -36,21 +39,42 @@ const (
 	statusFailedRetryable   = "FAILED_RETRYABLE"
 	statusFailedFinal       = "FAILED_FINAL"
 
+	accountStatusEmailAlreadyExists = "EMAIL_ALREADY_EXISTS"
+
+	emailStatusAvailable         = "AVAILABLE"
+	emailStatusRegistered        = "REGISTERED"
+	emailStatusUserAlreadyExists = "USER_ALREADY_EXISTS"
+	emailStatusRegistrationFail  = "REGISTRATION_FAILED"
+	emailStatusAuthFailed        = "AUTH_FAILED"
+
 	stepRegisterAccount = "register_account"
 	stepGoPayPayment    = "gopay_payment"
+	stepProbePlusTrial  = "probe_plus_trial"
+	stepRegisterMailbox = "register_mailbox"
+	stepMailboxOAuth    = "mailbox_oauth"
+
+	registrationOTPParam            = "registration_otp"
+	registrationOTPSubmittedAtParam = "registration_otp_submitted_at_unix"
 )
 
 type orchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
-	db            *gorm.DB
-	accountClient pb.AccountDatabaseServiceClient
-	browserClient pb.BrowserRegistrationClient
-	paymentClient pb.PaymentServiceClient
-	emailClient   pb.EmailServiceClient
-	otpAddr       string
-	otpTimeout    int32
-	temporal      temporalclient.Client
-	taskQueue     string
+	db                    *gorm.DB
+	accountClient         pb.AccountDatabaseServiceClient
+	browserClient         pb.BrowserRegistrationClient
+	paymentClient         pb.PaymentServiceClient
+	emailClient           pb.EmailServiceClient
+	mailboxRegisterClient pb.MailboxRegistrationServiceClient
+	otpAddr               string
+	otpTimeout            int32
+	regOTPTimeout         int32
+	temporal              temporalclient.Client
+	taskQueue             string
+}
+
+type registrationOTPResult struct {
+	Code   string
+	Source string
 }
 
 func (s *orchestratorServer) createAccount(ctx context.Context, account *pb.Account) (*pb.Account, error) {
@@ -121,6 +145,28 @@ func upsertJobParams(ctx context.Context, tx *gorm.DB, jobID string, params map[
 		Columns:   []clause.Column{{Name: "job_id"}, {Name: "key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
 	}).Create(&rows).Error
+}
+
+func (s *orchestratorServer) setJobParams(ctx context.Context, jobID string, params map[string]string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return upsertJobParams(ctx, tx, jobID, params)
+	})
+}
+
+func (s *orchestratorServer) getJobParam(ctx context.Context, jobID, key string) (string, bool, error) {
+	var param db.JobParam
+	err := s.db.WithContext(ctx).First(&param, "job_id = ? AND key = ?", jobID, key).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return param.Value, true, nil
+}
+
+func (s *orchestratorServer) deleteJobParam(ctx context.Context, jobID, key string) error {
+	return s.db.WithContext(ctx).Delete(&db.JobParam{}, "job_id = ? AND key = ?", jobID, key).Error
 }
 
 func (s *orchestratorServer) updateJob(ctx context.Context, jobID, statusValue, errorMessage string, result any) {
@@ -280,7 +326,7 @@ func (s *orchestratorServer) register(ctx context.Context, jobID string, account
 			cancelCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			cancelResp, cancelErr := s.browserClient.CancelRegister(cancelCtx, &pb.CancelRegisterRequest{FlowId: flowID})
-			data["cleanup"] = cleanupData(cancelResp.GetSuccess(), cancelResp.GetErrorMessage(), cancelErr)
+			data["cleanup"] = cleanupDataFromBrowser(cancelResp, cancelErr)
 		}
 	}()
 
@@ -298,19 +344,22 @@ func (s *orchestratorServer) register(ctx context.Context, jobID string, account
 	}
 
 	otpIssuedAfterUnix := startResp.GetOtpIssuedAfterUnix()
-	otp, err := s.waitForRegistrationOtp(ctx, account.GetEmail(), 60, otpIssuedAfterUnix)
+	otpTimeout := s.registrationOtpTimeout()
+	otp, err := s.waitForRegistrationOtp(ctx, jobID, account.GetEmail(), otpTimeout, otpIssuedAfterUnix)
 	data["registration_otp"] = map[string]any{
 		"email":              account.GetEmail(),
-		"timeout_seconds":    60,
+		"timeout_seconds":    otpTimeout,
 		"issued_after_unix":  otpIssuedAfterUnix,
 		"found":              err == nil,
+		"source":             otp.Source,
+		"manual_allowed":     true,
 		"otp_value_recorded": false,
 	}
 	if err != nil {
 		return nil, data, err
 	}
 
-	result, err = s.browserClient.CompleteRegister(ctx, &pb.CompleteRegisterRequest{FlowId: flowID, Otp: otp})
+	result, err = s.browserClient.CompleteRegister(ctx, &pb.CompleteRegisterRequest{FlowId: flowID, Otp: otp.Code})
 	data["browser_complete"] = registerResultData(result)
 	if err != nil {
 		return nil, data, err
@@ -325,23 +374,97 @@ func (s *orchestratorServer) register(ctx context.Context, jobID string, account
 	return result, data, nil
 }
 
-func (s *orchestratorServer) waitForRegistrationOtp(ctx context.Context, email string, timeoutSeconds int32, issuedAfterUnix int64) (string, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+10)*time.Second)
-	defer cancel()
+func (s *orchestratorServer) waitForRegistrationOtp(ctx context.Context, jobID, email string, timeoutSeconds int32, issuedAfterUnix int64) (registrationOTPResult, error) {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 120
+	}
+	defer func() {
+		_ = s.deleteJobParam(context.Background(), jobID, registrationOTPParam)
+		_ = s.deleteJobParam(context.Background(), jobID, registrationOTPSubmittedAtParam)
+	}()
 
-	resp, err := s.emailClient.WaitForEmail(reqCtx, &pb.WaitForEmailRequest{
-		EmailAddress:    email,
-		SubjectKeyword:  "ChatGPT",
-		TimeoutSeconds:  timeoutSeconds,
-		IssuedAfterUnix: issuedAfterUnix,
-	})
-	if err != nil {
-		return "", fmt.Errorf("registration otp not received after %ds: %w", timeoutSeconds, err)
+	type emailOTPResult struct {
+		code string
+		err  error
 	}
-	if resp.GetFound() && resp.GetContentExtracted() != "" {
-		return resp.GetContentExtracted(), nil
+
+	emailCtx, cancelEmail := context.WithCancel(ctx)
+	defer cancelEmail()
+
+	emailCh := make(chan emailOTPResult, 1)
+	go func() {
+		reqCtx, cancel := context.WithTimeout(emailCtx, time.Duration(timeoutSeconds+5)*time.Second)
+		defer cancel()
+		resp, err := s.emailClient.WaitForEmail(reqCtx, &pb.WaitForEmailRequest{
+			EmailAddress:    email,
+			TimeoutSeconds:  timeoutSeconds,
+			IssuedAfterUnix: issuedAfterUnix,
+		})
+		if err != nil {
+			emailCh <- emailOTPResult{err: err}
+			return
+		}
+		if resp == nil {
+			emailCh <- emailOTPResult{err: fmt.Errorf("email service returned empty otp response")}
+			return
+		}
+		if resp.GetFound() && strings.TrimSpace(resp.GetContentExtracted()) != "" {
+			emailCh <- emailOTPResult{code: strings.TrimSpace(resp.GetContentExtracted())}
+			return
+		}
+		emailCh <- emailOTPResult{err: fmt.Errorf("email otp not found")}
+	}()
+
+	deadline := time.NewTimer(time.Duration(timeoutSeconds) * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		select {
+		case emailResult := <-emailCh:
+			if strings.TrimSpace(emailResult.code) != "" {
+				return registrationOTPResult{Code: strings.TrimSpace(emailResult.code), Source: "email"}, nil
+			}
+			if emailResult.err != nil {
+				lastErr = emailResult.err
+			}
+			emailCh = nil
+		case <-ticker.C:
+			code, found, err := s.consumeManualRegistrationOtp(ctx, jobID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if found {
+				return registrationOTPResult{Code: code, Source: "manual"}, nil
+			}
+		case <-deadline.C:
+			if lastErr != nil {
+				return registrationOTPResult{}, fmt.Errorf("registration otp not received after %ds: %w", timeoutSeconds, lastErr)
+			}
+			return registrationOTPResult{}, fmt.Errorf("registration otp not received after %ds", timeoutSeconds)
+		case <-ctx.Done():
+			return registrationOTPResult{}, ctx.Err()
+		}
 	}
-	return "", fmt.Errorf("registration otp not received after %ds", timeoutSeconds)
+}
+
+func (s *orchestratorServer) consumeManualRegistrationOtp(ctx context.Context, jobID string) (string, bool, error) {
+	value, found, err := s.getJobParam(ctx, jobID, registrationOTPParam)
+	if err != nil || !found {
+		return "", false, err
+	}
+	code := normalizeOTP(value)
+	if code == "" {
+		return "", false, s.deleteJobParam(ctx, jobID, registrationOTPParam)
+	}
+	if err := s.deleteJobParam(ctx, jobID, registrationOTPParam); err != nil {
+		return "", false, err
+	}
+	_ = s.deleteJobParam(ctx, jobID, registrationOTPSubmittedAtParam)
+	return code, true, nil
 }
 
 func (s *orchestratorServer) pay(ctx context.Context, account *pb.Account, sessionToken, accessToken string) (result *pb.GoPayResponse, data map[string]any, err error) {
@@ -384,7 +507,7 @@ func (s *orchestratorServer) pay(ctx context.Context, account *pb.Account, sessi
 			cancelCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			cancelResp, cancelErr := s.paymentClient.CancelGoPay(cancelCtx, &pb.CancelGoPayRequest{FlowId: flowID})
-			data["cleanup"] = cleanupData(cancelResp.GetSuccess(), cancelResp.GetErrorMessage(), cancelErr)
+			data["cleanup"] = cleanupDataFromPayment(cancelResp, cancelErr)
 		}
 	}()
 
@@ -505,6 +628,22 @@ func (s *orchestratorServer) ActivateAccount(ctx context.Context, req *pb.Activa
 	}, nil
 }
 
+func (s *orchestratorServer) ProbePlusTrial(ctx context.Context, req *pb.ProbePlusTrialRequest) (*pb.ProbePlusTrialResponse, error) {
+	accountID := strings.TrimSpace(req.GetAccountId())
+	if accountID == "" {
+		return &pb.ProbePlusTrialResponse{ErrorMessage: "account_id is required"}, nil
+	}
+	jobID := uuid.NewString()
+	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("probe-plus-trial-"+jobID), ProbePlusTrialWorkflow, ProbePlusTrialWorkflowInput{
+		JobID:     jobID,
+		AccountID: accountID,
+	})
+	if err != nil {
+		return &pb.ProbePlusTrialResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
+	}
+	return &pb.ProbePlusTrialResponse{JobId: jobID, Started: true}, nil
+}
+
 func (s *orchestratorServer) RegisterAndActivateAccount(ctx context.Context, req *pb.RegisterAndActivateAccountRequest) (*pb.RegisterAndActivateAccountResponse, error) {
 	jobID := uuid.NewString()
 	accountID := strings.TrimSpace(req.GetAccountId())
@@ -538,6 +677,115 @@ func (s *orchestratorServer) RegisterAndActivateAccount(ctx context.Context, req
 		ChargeRef:         result.ChargeRef,
 		SnapToken:         result.SnapToken,
 	}, nil
+}
+
+func (s *orchestratorServer) RegisterMailbox(ctx context.Context, req *pb.RegisterMailboxRequest) (*pb.RegisterMailboxResponse, error) {
+	jobID := uuid.NewString()
+	var result RegisterMailboxWorkflowResult
+	run, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("register-mailbox-"+jobID), RegisterMailboxWorkflow, RegisterMailboxWorkflowInput{
+		JobID:      jobID,
+		ImportOnly: req.GetImportOnly(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := run.Get(ctx, &result); err != nil {
+		return &pb.RegisterMailboxResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
+	}
+	mailboxes := make([]*pb.RegisteredMailbox, 0, len(result.Mailboxes))
+	for _, mailbox := range result.Mailboxes {
+		mailboxes = append(mailboxes, &pb.RegisteredMailbox{
+			EmailAddress: mailbox.EmailAddress,
+			Status:       mailbox.Status,
+		})
+	}
+	return &pb.RegisterMailboxResponse{
+		JobId:        result.JobID,
+		Success:      result.Success,
+		ExitCode:     result.ExitCode,
+		ErrorMessage: result.ErrorMessage,
+		Mailboxes:    mailboxes,
+	}, nil
+}
+
+func (s *orchestratorServer) RunMailboxOAuth(ctx context.Context, req *pb.StartMailboxOAuthRequest) (*pb.StartMailboxOAuthResponse, error) {
+	jobID := uuid.NewString()
+	limit := req.GetLimit()
+	if limit <= 0 {
+		limit = 100
+	}
+	onlyMissing := req.GetOnlyMissing()
+	if strings.TrimSpace(req.GetEmailAddress()) == "" {
+		onlyMissing = true
+	}
+	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("mailbox-oauth-"+jobID), MailboxOAuthWorkflow, MailboxOAuthWorkflowInput{
+		JobID:        jobID,
+		EmailAddress: strings.TrimSpace(req.GetEmailAddress()),
+		OnlyMissing:  onlyMissing,
+		Limit:        limit,
+	})
+	if err != nil {
+		return &pb.StartMailboxOAuthResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
+	}
+	return &pb.StartMailboxOAuthResponse{JobId: jobID, Started: true}, nil
+}
+
+func (s *orchestratorServer) SubmitRegistrationOtp(ctx context.Context, req *pb.SubmitRegistrationOtpRequest) (*pb.SubmitRegistrationOtpResponse, error) {
+	otp := normalizeOTP(req.GetOtp())
+	if otp == "" {
+		return &pb.SubmitRegistrationOtpResponse{Success: false, ErrorMessage: "otp is required"}, nil
+	}
+
+	jobID, err := s.resolveRegistrationOTPJobID(ctx, strings.TrimSpace(req.GetJobId()), strings.TrimSpace(req.GetAccountId()))
+	if err != nil {
+		return &pb.SubmitRegistrationOtpResponse{Success: false, ErrorMessage: err.Error()}, nil
+	}
+
+	if err := s.setJobParams(ctx, jobID, map[string]string{
+		registrationOTPParam:            otp,
+		registrationOTPSubmittedAtParam: strconv.FormatInt(time.Now().Unix(), 10),
+	}); err != nil {
+		return &pb.SubmitRegistrationOtpResponse{Success: false, JobId: jobID, ErrorMessage: err.Error()}, nil
+	}
+
+	log.Printf("[orchestrator] registration otp submitted job=%s source=manual", jobID)
+	return &pb.SubmitRegistrationOtpResponse{Success: true, JobId: jobID}, nil
+}
+
+func (s *orchestratorServer) resolveRegistrationOTPJobID(ctx context.Context, jobID, accountID string) (string, error) {
+	if jobID != "" {
+		var job db.Job
+		err := s.db.WithContext(ctx).First(&job, "id = ?", jobID).Error
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return "", fmt.Errorf("job not found: %s", jobID)
+			}
+			return "", err
+		}
+		if job.Status != statusRunning {
+			return "", fmt.Errorf("job is not running: %s", job.Status)
+		}
+		if job.Action != actionRegister && job.Action != actionRegisterAndActivate {
+			return "", fmt.Errorf("job does not accept registration otp: %s", job.Action)
+		}
+		return jobID, nil
+	}
+	if accountID == "" {
+		return "", fmt.Errorf("job_id or account_id is required")
+	}
+
+	var job db.Job
+	err := s.db.WithContext(ctx).
+		Where("account_id = ? AND action IN ? AND status = ?", accountID, []string{actionRegister, actionRegisterAndActivate}, statusRunning).
+		Order("updated_at DESC").
+		First(&job).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return "", fmt.Errorf("running registration job not found for account %s", accountID)
+		}
+		return "", err
+	}
+	return job.ID, nil
 }
 
 func (s *orchestratorServer) GetJob(ctx context.Context, req *pb.GetJobRequest) (*pb.GetJobResponse, error) {
@@ -635,6 +883,7 @@ func registerResultData(resp *pb.RegisterResponse) map[string]any {
 		"access_token_present":     resp.GetAccessToken() != "",
 		"device_id_present":        resp.GetDeviceId() != "",
 		"plus_trial_eligible":      resp.GetPlusTrialEligible(),
+		"plus_trial_checked":       resp.GetPlusTrialChecked(),
 		"checkout_url_present":     resp.GetCheckoutUrl() != "",
 		"sensitive_values_stored":  false,
 		"credential_values_stored": false,
@@ -653,6 +902,23 @@ func paymentStartData(resp *pb.StartGoPayResponse) map[string]any {
 		"snap_token_present": resp.GetSnapToken() != "",
 		"issued_after_unix":  resp.GetIssuedAfterUnix(),
 		"expires_at_unix":    resp.GetExpiresAtUnix(),
+	}
+}
+
+func plusTrialProbeData(resp *pb.ProbePlusTrialPaymentResponse) map[string]any {
+	if resp == nil {
+		return map[string]any{"response_present": false}
+	}
+	return map[string]any{
+		"response_present":     true,
+		"success":              resp.GetSuccess(),
+		"error_message":        resp.GetErrorMessage(),
+		"checked":              resp.GetChecked(),
+		"plus_trial_eligible":  resp.GetPlusTrialEligible(),
+		"amount":               resp.GetAmount(),
+		"currency":             resp.GetCurrency(),
+		"source":               resp.GetSource(),
+		"checkout_url_present": resp.GetCheckoutUrl() != "",
 	}
 }
 
@@ -681,11 +947,37 @@ func cleanupData(success bool, errorMessage string, err error) map[string]any {
 	return data
 }
 
+func cleanupDataFromBrowser(resp *pb.CancelRegisterResponse, err error) map[string]any {
+	if resp == nil {
+		return cleanupData(false, "", err)
+	}
+	return cleanupData(resp.GetSuccess(), resp.GetErrorMessage(), err)
+}
+
+func cleanupDataFromPayment(resp *pb.CancelGoPayResponse, err error) map[string]any {
+	if resp == nil {
+		return cleanupData(false, "", err)
+	}
+	return cleanupData(resp.GetSuccess(), resp.GetErrorMessage(), err)
+}
+
 func (s *orchestratorServer) paymentOtpTimeout() int32 {
 	if s.otpTimeout <= 0 {
 		return 60
 	}
 	return s.otpTimeout
+}
+
+func (s *orchestratorServer) registrationOtpTimeout() int32 {
+	if s.regOTPTimeout <= 0 {
+		return 120
+	}
+	return s.regOTPTimeout
+}
+
+func normalizeOTP(value string) string {
+	replacer := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "", "-", "")
+	return strings.TrimSpace(replacer.Replace(value))
 }
 
 func main() {
@@ -719,6 +1011,13 @@ func main() {
 	}
 	defer emailConn.Close()
 
+	mailboxRegisterAddr := envDefault("MAILBOX_REGISTER_ADDR", "outlook-register-service:50051")
+	mailboxRegisterConn, err := grpc.NewClient(mailboxRegisterAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to mailbox registration service: %v", err)
+	}
+	defer mailboxRegisterConn.Close()
+
 	temporalNamespace := envDefault("TEMPORAL_NAMESPACE", "default")
 	temporalClient, closeTemporal, err := newTemporalClient(temporalNamespace)
 	if err != nil {
@@ -733,15 +1032,17 @@ func main() {
 	}
 
 	server := &orchestratorServer{
-		db:            db.InitDB(),
-		accountClient: pb.NewAccountDatabaseServiceClient(accountDBConn),
-		browserClient: pb.NewBrowserRegistrationClient(browserConn),
-		paymentClient: pb.NewPaymentServiceClient(paymentConn),
-		emailClient:   pb.NewEmailServiceClient(emailConn),
-		otpAddr:       envDefault("GOPAY_OTP_SERVICE_ADDR", envDefault("OTP_ADDR", "gopay-payment:50051")),
-		otpTimeout:    envInt32("GOPAY_OTP_TIMEOUT_SECONDS", 60),
-		temporal:      temporalClient,
-		taskQueue:     envDefault("TEMPORAL_TASK_QUEUE", taskQueueDefault),
+		db:                    db.InitDB(),
+		accountClient:         pb.NewAccountDatabaseServiceClient(accountDBConn),
+		browserClient:         pb.NewBrowserRegistrationClient(browserConn),
+		paymentClient:         pb.NewPaymentServiceClient(paymentConn),
+		emailClient:           pb.NewEmailServiceClient(emailConn),
+		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(mailboxRegisterConn),
+		otpAddr:               envDefault("GOPAY_OTP_SERVICE_ADDR", envDefault("OTP_ADDR", "gopay-payment:50051")),
+		otpTimeout:            envInt32("GOPAY_OTP_TIMEOUT_SECONDS", 60),
+		regOTPTimeout:         envInt32("REGISTRATION_OTP_TIMEOUT_SECONDS", 180),
+		temporal:              temporalClient,
+		taskQueue:             envDefault("TEMPORAL_TASK_QUEUE", taskQueueDefault),
 	}
 
 	temporalWorker := temporalworker.New(temporalClient, server.taskQueue, temporalworker.Options{})

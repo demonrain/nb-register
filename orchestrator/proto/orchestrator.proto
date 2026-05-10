@@ -50,6 +50,16 @@ message ActivateAccountResponse {
   string snap_token = 5;
 }
 
+message ProbePlusTrialRequest {
+  string account_id = 1;
+}
+
+message ProbePlusTrialResponse {
+  string job_id = 1;
+  bool started = 2;
+  string error_message = 3;
+}
+
 message RegisterAndActivateAccountRequest {
   reserved 1, 2, 3, 4, 5, 8, 9, 10;
   string email = 6;
@@ -104,10 +114,58 @@ message GetJobResponse {
   string error_message = 2;
 }
 
+message RegisterMailboxRequest {
+  bool import_only = 1;
+}
+
+message RegisterMailboxResponse {
+  string job_id = 1;
+  bool success = 2;
+  int32 exit_code = 3;
+  string error_message = 4;
+  repeated RegisteredMailbox mailboxes = 5;
+}
+
+message RegisteredMailbox {
+  string email_address = 1;
+  string password = 2;
+  string refresh_token = 3;
+  string access_token = 4;
+  string status = 5;
+}
+
+message StartMailboxOAuthRequest {
+  string email_address = 1;
+  bool only_missing = 2;
+  int32 limit = 3;
+}
+
+message StartMailboxOAuthResponse {
+  string job_id = 1;
+  bool started = 2;
+  string error_message = 3;
+}
+
+message SubmitRegistrationOtpRequest {
+  string job_id = 1;
+  string account_id = 2;
+  string otp = 3;
+}
+
+message SubmitRegistrationOtpResponse {
+  bool success = 1;
+  string job_id = 2;
+  string error_message = 3;
+}
+
 service OrchestratorService {
   rpc RegisterAccount(RegisterAccountRequest) returns (RegisterAccountResponse);
   rpc ActivateAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
+  rpc ProbePlusTrial(ProbePlusTrialRequest) returns (ProbePlusTrialResponse);
   rpc RegisterAndActivateAccount(RegisterAndActivateAccountRequest) returns (RegisterAndActivateAccountResponse);
+  rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
+  rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);
+  rpc SubmitRegistrationOtp(SubmitRegistrationOtpRequest) returns (SubmitRegistrationOtpResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
 
   // Deprecated: use RegisterAccount.

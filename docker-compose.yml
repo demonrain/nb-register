@@ -1,4 +1,14 @@
 services:
+  camoufox-base:
+    image: nb-register-camoufox-base:latest
+    build:
+      context: ./docker/camoufox-base
+      dockerfile: Dockerfile
+      args:
+        CAMOUFOX_FETCH_PROXY: ${CAMOUFOX_FETCH_PROXY:-http://host.docker.internal:10809}
+    profiles:
+      - build
+
   postgres:
     image: docker.m.daocloud.io/library/postgres:15-alpine
     environment:
@@ -32,13 +42,59 @@ services:
     build:
       context: ./outlook-imap-service
       dockerfile: Dockerfile
+    init: true
     ports:
       - "${OUTLOOK_GRPC_PORT:-50053}:50051" # gRPC
     environment:
       - LISTEN_ADDR=:50051
-      - TOKEN_DIR=${TOKEN_DIR:-tokens}
+      - PG_DSN=host=postgres user=${POSTGRES_USER:-nb_register} password=${POSTGRES_PASSWORD:-nb_register} dbname=${POSTGRES_DB:-nb_register} port=5432 sslmode=disable
+      - OUTLOOK_OAUTH_CLIENT_ID=${OUTLOOK_OAUTH_CLIENT_ID:-}
+      - OUTLOOK_OAUTH_SCOPE=${OUTLOOK_OAUTH_SCOPE:-}
+      - OUTLOOK_POLL_INTERVAL_SECONDS=${OUTLOOK_POLL_INTERVAL_SECONDS:-5}
+      - OUTLOOK_MESSAGE_LIMIT=${OUTLOOK_MESSAGE_LIMIT:-25}
+      - OUTLOOK_HTTP_TIMEOUT_SECONDS=${OUTLOOK_HTTP_TIMEOUT_SECONDS:-20}
+      - OUTLOOK_ALIAS_RANDOM_LENGTH=${OUTLOOK_ALIAS_RANDOM_LENGTH:-6}
+      - OUTLOOK_GRAPH_MESSAGES_URL=${OUTLOOK_GRAPH_MESSAGES_URL:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_started
+    restart: always
+
+  outlook-register-service:
+    build:
+      context: ./outlook-register-service
+      dockerfile: Dockerfile
+    init: true
+    ports:
+      - "${OUTLOOK_REGISTER_GRPC_PORT:-50056}:50051" # gRPC
+    environment:
+      - LISTEN_ADDR=:50051
+      - OUTLOOK_REGISTER_ENABLED=${OUTLOOK_REGISTER_ENABLED:-false}
+      - OUTLOOK_REGISTER_PROXY=${OUTLOOK_REGISTER_PROXY:-socks5://host.docker.internal:10810}
+      - OUTLOOK_REGISTER_BROWSER=${OUTLOOK_REGISTER_BROWSER:-patchright}
+      - OUTLOOK_REGISTER_EMAIL_SUFFIX=${OUTLOOK_REGISTER_EMAIL_SUFFIX:-@outlook.com}
+      - OUTLOOK_REGISTER_CONCURRENT_FLOWS=${OUTLOOK_REGISTER_CONCURRENT_FLOWS:-1}
+      - OUTLOOK_REGISTER_MAX_TASKS=${OUTLOOK_REGISTER_MAX_TASKS:-1}
+      - OUTLOOK_REGISTER_BOT_PROTECTION_WAIT=${OUTLOOK_REGISTER_BOT_PROTECTION_WAIT:-11}
+      - OUTLOOK_REGISTER_MAX_CAPTCHA_RETRIES=${OUTLOOK_REGISTER_MAX_CAPTCHA_RETRIES:-7}
+      - OUTLOOK_REGISTER_MANUAL_CAPTCHA=${OUTLOOK_REGISTER_MANUAL_CAPTCHA:-false}
+      - OUTLOOK_REGISTER_MANUAL_CAPTCHA_TIMEOUT_SECONDS=${OUTLOOK_REGISTER_MANUAL_CAPTCHA_TIMEOUT_SECONDS:-300}
+      - OUTLOOK_REGISTER_ENABLE_OAUTH2=${OUTLOOK_REGISTER_ENABLE_OAUTH2:-true}
+      - OUTLOOK_REGISTER_OAUTH_CLIENT_ID=${OUTLOOK_REGISTER_OAUTH_CLIENT_ID:-}
+      - OUTLOOK_REGISTER_OAUTH_REDIRECT_URL=${OUTLOOK_REGISTER_OAUTH_REDIRECT_URL:-}
+      - OUTLOOK_REGISTER_OAUTH_SCOPES=${OUTLOOK_REGISTER_OAUTH_SCOPES:-offline_access https://graph.microsoft.com/Mail.Read}
+      - OUTLOOK_REGISTER_INTERVAL_SECONDS=${OUTLOOK_REGISTER_INTERVAL_SECONDS:-0}
+      - OUTLOOK_REGISTER_RUN_TIMEOUT_SECONDS=${OUTLOOK_REGISTER_RUN_TIMEOUT_SECONDS:-900}
+      - OUTLOOK_REGISTER_LOCK_WAIT_SECONDS=${OUTLOOK_REGISTER_LOCK_WAIT_SECONDS:-0}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      - ./outlook-imap-service/tokens:/app/tokens
+      - ./outlook-register-service/register-results:/opt/OutlookRegister/Results
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "2gb"
     restart: always
 
   account-db:
@@ -50,8 +106,6 @@ services:
     environment:
       - PG_DSN=host=postgres user=${POSTGRES_USER:-nb_register} password=${POSTGRES_PASSWORD:-nb_register} dbname=${POSTGRES_DB:-nb_register} port=5432 sslmode=disable
       - LISTEN_ADDR=:50051
-      - OUTLOOK_EMAIL=${OUTLOOK_EMAIL}
-      - OUTLOOK_ALIAS_RANDOM_LENGTH=${OUTLOOK_ALIAS_RANDOM_LENGTH:-6}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -71,9 +125,11 @@ services:
       - PAYMENT_ADDR=${PAYMENT_ADDR:-gopay-payment:50051}
       - ACCOUNT_DB_ADDR=account-db:50051
       - EMAIL_ADDR=outlook-imap-service:50051
+      - MAILBOX_REGISTER_ADDR=outlook-register-service:50051
       - OTP_ADDR=${OTP_ADDR:-gopay-payment:50051}
       - GOPAY_OTP_SERVICE_ADDR=${GOPAY_OTP_SERVICE_ADDR:-gopay-payment:50051}
       - GOPAY_OTP_TIMEOUT_SECONDS=${GOPAY_OTP_TIMEOUT_SECONDS:-60}
+      - REGISTRATION_OTP_TIMEOUT_SECONDS=${REGISTRATION_OTP_TIMEOUT_SECONDS:-180}
       - TEMPORAL_DEV_SERVER=false
       - TEMPORAL_ADDR=temporal:7233
       - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
@@ -85,6 +141,7 @@ services:
       - account-db
       - gopay-payment
       - outlook-imap-service
+      - outlook-register-service
       - postgres
       - temporal
     restart: always
@@ -118,10 +175,15 @@ services:
       - LISTEN_ADDR=:8080
       - ACCOUNT_DB_ADDR=account-db:50051
       - ORCHESTRATOR_ADDR=orchestrator:50051
+      - EMAIL_ADDR=outlook-imap-service:50051
+      - MAILBOX_REGISTER_ADDR=outlook-register-service:50051
       - ORCHESTRATOR_PG_DSN=host=postgres user=${POSTGRES_USER:-nb_register} password=${POSTGRES_PASSWORD:-nb_register} dbname=${POSTGRES_DB:-nb_register} port=5432 sslmode=disable
+      - MAILBOX_REGISTER_TIMEOUT_SECONDS=${MAILBOX_REGISTER_TIMEOUT_SECONDS:-1800}
     depends_on:
       - account-db
       - orchestrator
+      - outlook-imap-service
+      - outlook-register-service
       - postgres
     restart: always
 
@@ -135,6 +197,7 @@ services:
       - GRPC_PORT=50051
       - PROXY_URL=${REGISTER_PROXY_URL:-socks5://host.docker.internal:10813}
       - EMAIL_ADDR=outlook-imap-service:50051
+      - BROWSER_CHECK_PLUS_TRIAL=${BROWSER_CHECK_PLUS_TRIAL:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: always

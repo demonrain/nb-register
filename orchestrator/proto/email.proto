@@ -4,6 +4,59 @@ package email;
 
 option go_package = "./;pb";
 
+message EmailMailbox {
+  string email_address = 1;
+  string password = 2;
+  string refresh_token = 3;
+  string access_token = 4;
+  string status = 5;
+  reserved 6;
+  string last_error = 7;
+  bool is_primary = 8;
+  string primary_email = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+message GetEmailRequest {
+  reserved 1;
+  repeated string exclude_email_addresses = 2;
+}
+
+message GetEmailResponse {
+  string email_address = 1;
+  string password = 2;
+  EmailMailbox mailbox = 3;
+}
+
+message MarkEmailStatusRequest {
+  string email_address = 1;
+  reserved 2;
+  string status = 3;
+  string last_error = 4;
+}
+
+message MarkEmailStatusResponse {
+  EmailMailbox mailbox = 1;
+}
+
+message UpsertEmailMailboxRequest {
+  EmailMailbox mailbox = 1;
+}
+
+message UpsertEmailMailboxResponse {
+  EmailMailbox mailbox = 1;
+}
+
+message ListEmailMailboxesRequest {
+  string status = 1;
+  int32 limit = 2;
+}
+
+message ListEmailMailboxesResponse {
+  repeated EmailMailbox mailboxes = 1;
+}
+
 message WaitForEmailRequest {
   string email_address = 1;
   string subject_keyword = 2; // e.g., "OTP" or "验证码"
@@ -17,5 +70,9 @@ message WaitForEmailResponse {
 }
 
 service EmailService {
+  rpc GetEmail(GetEmailRequest) returns (GetEmailResponse);
+  rpc MarkEmailStatus(MarkEmailStatusRequest) returns (MarkEmailStatusResponse);
+  rpc UpsertMailbox(UpsertEmailMailboxRequest) returns (UpsertEmailMailboxResponse);
+  rpc ListMailboxes(ListEmailMailboxesRequest) returns (ListEmailMailboxesResponse);
   rpc WaitForEmail(WaitForEmailRequest) returns (WaitForEmailResponse);
 }

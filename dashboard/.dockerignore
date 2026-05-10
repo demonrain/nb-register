@@ -1,0 +1,8 @@
+pb/
+web/node_modules/
+web/dist/
+dashboard
+*.test
+*.out
+.git/
+.DS_Store

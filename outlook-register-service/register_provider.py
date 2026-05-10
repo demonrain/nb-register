@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+DEFAULT_REPO_DIR = Path(os.environ.get("OUTLOOK_REGISTER_DIR", "/opt/OutlookRegister"))
+DEFAULT_RESULTS_DIR = DEFAULT_REPO_DIR / "Results"
+DEFAULT_OAUTH_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+DEFAULT_OAUTH_REDIRECT_URL = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+DEFAULT_SCOPES = "offline_access https://graph.microsoft.com/Mail.Read"
+LOCK_FILE_NAME = ".nb_register.lock"
+
+logger = logging.getLogger("outlook-imap-register")
+
+
+@dataclass(frozen=True)
+class MailboxRecord:
+    email: str
+    password: str
+    refresh_token: str = ""
+    access_token: str = ""
+    source: str = ""
+
+
+class RegistrationAlreadyRunning(RuntimeError):
+    pass
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value == "":
+        return default
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("invalid integer %s=%r; using %s", name, value, default)
+        return default
+
+
+def env_str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def split_scopes(value: str) -> list[str]:
+    value = value.strip()
+    if value == "":
+        value = DEFAULT_SCOPES
+    if value.startswith("["):
+        parsed = json.loads(value)
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part for part in value.replace(",", " ").split() if part]
+
+
+def repo_dir() -> Path:
+    return Path(env_str("OUTLOOK_REGISTER_DIR", str(DEFAULT_REPO_DIR))).resolve()
+
+
+def results_dir() -> Path:
+    return Path(env_str("OUTLOOK_REGISTER_RESULTS_DIR", str(repo_dir() / "Results"))).resolve()
+
+
+def redact_email(email: str) -> str:
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return "***"
+    if len(local) > 2:
+        local = local[:2] + "***"
+    else:
+        local = "***"
+    return f"{local}@{domain}"
+
+
+def build_register_config() -> dict:
+    enable_oauth2 = env_bool("OUTLOOK_REGISTER_ENABLE_OAUTH2", True)
+    client_id = (
+        env_str("OUTLOOK_REGISTER_OAUTH_CLIENT_ID")
+        or env_str("OUTLOOK_OAUTH_CLIENT_ID")
+        or DEFAULT_OAUTH_CLIENT_ID
+    )
+    redirect_url = (
+        env_str("OUTLOOK_REGISTER_OAUTH_REDIRECT_URL")
+        or env_str("OUTLOOK_OAUTH_REDIRECT_URL")
+        or DEFAULT_OAUTH_REDIRECT_URL
+    )
+    if enable_oauth2 and (not client_id or not redirect_url):
+        raise SystemExit(
+            "OUTLOOK_REGISTER_OAUTH_CLIENT_ID and OUTLOOK_REGISTER_OAUTH_REDIRECT_URL "
+            "are required when OUTLOOK_REGISTER_ENABLE_OAUTH2=true"
+        )
+
+    return {
+        "choose_browser": env_str("OUTLOOK_REGISTER_BROWSER", "patchright"),
+        "email_suffix": env_str("OUTLOOK_REGISTER_EMAIL_SUFFIX", "@outlook.com"),
+        "proxy": env_str("OUTLOOK_REGISTER_PROXY"),
+        "bot_protection_wait": env_int("OUTLOOK_REGISTER_BOT_PROTECTION_WAIT", 11),
+        "max_captcha_retries": env_int("OUTLOOK_REGISTER_MAX_CAPTCHA_RETRIES", 2),
+        "manual_captcha": env_bool("OUTLOOK_REGISTER_MANUAL_CAPTCHA", False),
+        "manual_captcha_timeout": env_int("OUTLOOK_REGISTER_MANUAL_CAPTCHA_TIMEOUT_SECONDS", 300),
+        "concurrent_flows": forced_single_value("OUTLOOK_REGISTER_CONCURRENT_FLOWS"),
+        "max_tasks": forced_single_value("OUTLOOK_REGISTER_MAX_TASKS"),
+        "oauth2_required": env_bool("OUTLOOK_REGISTER_REQUIRE_OAUTH2", False),
+        "oauth2": {
+            "enable_oauth2": enable_oauth2,
+            "client_id": client_id,
+            "redirect_url": redirect_url,
+            "Scopes": split_scopes(env_str("OUTLOOK_REGISTER_OAUTH_SCOPES", DEFAULT_SCOPES)),
+        },
+        "playwright": {
+            "browser_path": env_str("OUTLOOK_REGISTER_PLAYWRIGHT_BROWSER_PATH"),
+        },
+    }
+
+
+def forced_single_value(name: str) -> int:
+    configured = env_int(name, 1)
+    if configured != 1:
+        logger.warning("%s=%s ignored; OutlookRegister is forced to single-thread mode", name, configured)
+    return 1
+
+
+@contextmanager
+def registration_lock():
+    default_lock_path = results_dir() / LOCK_FILE_NAME
+    lock_path = Path(env_str("OUTLOOK_REGISTER_LOCK_FILE", str(default_lock_path))).resolve()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    wait_seconds = env_int("OUTLOOK_REGISTER_LOCK_WAIT_SECONDS", 0)
+    deadline = time.monotonic() + wait_seconds
+
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if wait_seconds <= 0 or time.monotonic() >= deadline:
+                    raise RegistrationAlreadyRunning(
+                        f"OutlookRegister is already running; lock={lock_path}"
+                    ) from exc
+                time.sleep(1)
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()}\nstarted_at={int(time.time())}\n")
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def write_register_config(path: Path) -> None:
+    config_path = path / "config.json"
+    config_path.write_text(
+        json.dumps(build_register_config(), ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("wrote OutlookRegister config to %s", config_path)
+
+
+def run_outlook_register(path: Path) -> int:
+    script_path = Path("/app/camoufox_register.py")
+    if not script_path.exists():
+        logger.warning(f"Camoufox script not found at {script_path}, looking in current dir")
+        script_path = Path("camoufox_register.py")
+        if not script_path.exists():
+            raise FileNotFoundError("camoufox_register.py not found")
+
+    command = [sys.executable, "-u", str(script_path)]
+    if env_bool("OUTLOOK_REGISTER_USE_XVFB", False) and not os.environ.get("DISPLAY"):
+        command = ["xvfb-run", "-a", *command]
+
+    logger.info("starting Camoufox registration")
+    timeout = env_int("OUTLOOK_REGISTER_RUN_TIMEOUT_SECONDS", 900)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proxy = env_str("OUTLOOK_REGISTER_PROXY")
+    if proxy:
+        env.setdefault("HTTP_PROXY", proxy)
+        env.setdefault("HTTPS_PROXY", proxy)
+        env.setdefault("http_proxy", proxy)
+        env.setdefault("https_proxy", proxy)
+        env.setdefault("NO_PROXY", "localhost,127.0.0.1")
+        env.setdefault("no_proxy", "localhost,127.0.0.1")
+    process = subprocess.Popen(command, cwd="/app", env=env, start_new_session=True)
+    try:
+        code = process.wait(timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        logger.warning("Camoufox script exceeded %ss; terminating browser process group", timeout)
+        terminate_process_group(process.pid)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Camoufox script did not exit cleanly after process group termination")
+        return 124
+
+    if code != 0:
+        logger.warning("Camoufox script exited with code %s; collecting any completed results", code)
+    return code
+
+
+def browser_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proxy = env_str("OUTLOOK_REGISTER_PROXY")
+    if proxy:
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+        env["http_proxy"] = proxy
+        env["https_proxy"] = proxy
+        env.setdefault("NO_PROXY", "localhost,127.0.0.1")
+        env.setdefault("no_proxy", "localhost,127.0.0.1")
+    return env
+
+
+def terminate_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        logger.warning("failed to terminate OutlookRegister process group: %s", exc)
+        return
+    for _ in range(10):
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        logger.warning("failed to kill OutlookRegister process group: %s", exc)
+
+
+def parse_token_file(path: Path) -> Iterable[MailboxRecord]:
+    if not path.exists():
+        return
+    for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("---", 4)
+        if len(parts) < 3:
+            logger.warning("skip malformed token line %s:%s", path, line_no)
+            continue
+        email, password, refresh_token = (part.strip() for part in parts[:3])
+        access_token = parts[3].strip() if len(parts) >= 4 else ""
+        if not email or not refresh_token:
+            logger.warning("skip token line without email or refresh token %s:%s", path, line_no)
+            continue
+        yield MailboxRecord(
+            email=email.lower(),
+            password=password,
+            refresh_token=refresh_token,
+            access_token=access_token,
+            source=path.name,
+        )
+
+
+def parse_password_file(path: Path) -> Iterable[MailboxRecord]:
+    if not path.exists():
+        return
+    for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            logger.warning("skip malformed mailbox line %s:%s", path, line_no)
+            continue
+        email, password = (part.strip() for part in line.split(":", 1))
+        if not email:
+            logger.warning("skip mailbox line without email %s:%s", path, line_no)
+            continue
+        yield MailboxRecord(email=email.lower(), password=password, source=path.name)
+
+
+def collect_records(path: Path, include_password_only: bool) -> list[MailboxRecord]:
+    records: dict[str, MailboxRecord] = {}
+    for record in parse_token_file(path / "outlook_token.txt") or []:
+        records[record.email] = record
+
+    if include_password_only:
+        for filename in ("logged_email.txt", "unlogged_email.txt"):
+            for record in parse_password_file(path / filename) or []:
+                records.setdefault(record.email, record)
+
+    return list(records.values())
+
+
+def record_response(record: MailboxRecord) -> dict:
+    return {
+        "email_address": record.email,
+        "password": record.password,
+        "refresh_token": record.refresh_token,
+        "access_token": record.access_token,
+        "source": record.source,
+    }
+
+
+def new_or_updated_records(before: dict[str, MailboxRecord], after: list[MailboxRecord]) -> list[MailboxRecord]:
+    changed: list[MailboxRecord] = []
+    for record in after:
+        old = before.get(record.email)
+        if old is None:
+            changed.append(record)
+            continue
+        if record.refresh_token and record.refresh_token != old.refresh_token:
+            changed.append(record)
+            continue
+        if record.access_token and record.access_token != old.access_token:
+            changed.append(record)
+    return changed
+
+
+def run_oauth(email_address: str = "", only_missing: bool = True, limit: int = 100) -> dict:
+    return {
+        "success": False,
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "error_message": "Browser-based OAuth is not handled by outlook-register-service.",
+        "results": [],
+    }
+
+
+def run_once_locked() -> int:
+    result = run_registration_request_locked(
+        enabled=env_bool("OUTLOOK_REGISTER_ENABLED", False),
+        import_only=env_bool("OUTLOOK_REGISTER_IMPORT_ONLY", False),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("success"):
+        return int(result.get("exit_code") or 0)
+    return int(result.get("exit_code") or 1)
+
+
+def run_once() -> int:
+    try:
+        with registration_lock():
+            return run_once_locked()
+    except RegistrationAlreadyRunning as exc:
+        logger.warning("%s", exc)
+        return env_int("OUTLOOK_REGISTER_LOCK_BUSY_EXIT_CODE", 1)
+
+
+def run_registration_request_locked(enabled: bool, import_only: bool) -> dict:
+    path = repo_dir()
+    out_dir = results_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    before_records = {
+        record.email: record
+        for record in collect_records(out_dir, include_password_only=True)
+    }
+
+    if import_only:
+        records = list(before_records.values())
+        error_message = "" if records else "no mailbox records found to import"
+        return {
+            "success": bool(records),
+            "exit_code": 0,
+            "error_message": error_message,
+            "accounts": [record_response(record) for record in records],
+        }
+
+    if not enabled:
+        return {
+            "success": False,
+            "exit_code": 0,
+            "error_message": "mailbox registration is disabled",
+            "accounts": [],
+        }
+
+    write_register_config(path)
+    code = run_outlook_register(path)
+    after_records = collect_records(out_dir, include_password_only=True)
+    records = new_or_updated_records(before_records, after_records)
+
+    error_message = ""
+    if not records:
+        if code != 0:
+            error_message = f"mailbox registration failed with exit code {code}"
+        else:
+            error_message = "mailbox registration completed but returned no account records"
+
+    return {
+        "success": bool(records),
+        "exit_code": code,
+        "error_message": error_message,
+        "accounts": [record_response(record) for record in records],
+    }
+
+
+def run_registration_request(enabled: bool, import_only: bool) -> dict:
+    try:
+        with registration_lock():
+            return run_registration_request_locked(enabled=enabled, import_only=import_only)
+    except RegistrationAlreadyRunning as exc:
+        logger.warning("%s", exc)
+        return {
+            "success": False,
+            "exit_code": env_int("OUTLOOK_REGISTER_LOCK_BUSY_EXIT_CODE", 1),
+            "error_message": str(exc),
+            "accounts": [],
+        }
+
+
+def configure_logging() -> None:
+    level = env_str("LOG_LEVEL", "INFO").upper()
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_file = env_str("OUTLOOK_REGISTER_LOG_FILE", str(results_dir() / "register.log"))
+    if log_file:
+        try:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        except OSError as exc:
+            print(f"could not open OutlookRegister log file {log_file}: {exc}", file=sys.stderr)
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_logging()
+    parser = argparse.ArgumentParser(description="Run OutlookRegister and return registered mailbox accounts.")
+    parser.add_argument("command", choices=("run", "import", "config", "oauth", "oauth-worker"), nargs="?", default="run")
+    parser.add_argument("--email", default="", help="single mailbox email for oauth")
+    parser.add_argument("--all", action="store_true", help="include mailboxes that already have refresh tokens")
+    parser.add_argument("--limit", type=int, default=100, help="maximum mailboxes for oauth")
+    args = parser.parse_args(argv)
+
+    if args.command == "config":
+        print(json.dumps(build_register_config(), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "oauth-worker":
+        return 1
+
+    if args.command == "oauth":
+        result = run_oauth(email_address=args.email, only_missing=not args.all, limit=args.limit)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("success") else 1
+
+    if args.command == "import":
+        os.environ["OUTLOOK_REGISTER_IMPORT_ONLY"] = "true"
+        return run_once()
+
+    interval = env_int("OUTLOOK_REGISTER_INTERVAL_SECONDS", 0)
+    if interval > 0 and not env_bool("OUTLOOK_REGISTER_ENABLED", False):
+        logger.info("OUTLOOK_REGISTER_ENABLED=false; ignoring OUTLOOK_REGISTER_INTERVAL_SECONDS=%s", interval)
+        interval = 0
+    while True:
+        code = run_once()
+        if interval <= 0:
+            return code
+        logger.info("sleeping %ss before next OutlookRegister run", interval)
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

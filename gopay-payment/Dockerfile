@@ -30,6 +30,8 @@ COPY gopay-flow/ /app/gopay-flow/
 COPY NOTICE LICENSE run_gopay.sh run_payment_server.sh /app/
 
 WORKDIR /app/gopay-flow
+RUN python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. proto/payment.proto proto/otp.proto
+
 EXPOSE 50051 8081
 
 ENTRYPOINT ["python", "payment_server.py"]

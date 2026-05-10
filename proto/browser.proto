@@ -22,6 +22,8 @@ message RegisterResponse {
   string device_id = 5;
   bool plus_trial_eligible = 6;
   string checkout_url = 7;
+  bool plus_trial_checked = 8;
+  reserved 9 to 11;
 }
 
 message StartRegisterResponse {

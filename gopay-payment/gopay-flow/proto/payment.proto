@@ -19,6 +19,22 @@ message StartGoPayResponse {
   int64 expires_at_unix = 6;
 }
 
+message ProbePlusTrialPaymentRequest {
+  string session_token = 1;
+  string access_token = 2;
+}
+
+message ProbePlusTrialPaymentResponse {
+  bool success = 1;
+  string error_message = 2;
+  bool checked = 3;
+  bool plus_trial_eligible = 4;
+  int64 amount = 5;
+  string currency = 6;
+  string source = 7;
+  string checkout_url = 8;
+}
+
 message CompleteGoPayRequest {
   string flow_id = 1;
   string otp = 2;
@@ -42,6 +58,7 @@ message GoPayResponse {
 
 service PaymentService {
   rpc StartGoPay(StartGoPayRequest) returns (StartGoPayResponse);
+  rpc ProbePlusTrial(ProbePlusTrialPaymentRequest) returns (ProbePlusTrialPaymentResponse);
   rpc CompleteGoPay(CompleteGoPayRequest) returns (GoPayResponse);
   rpc CancelGoPay(CancelGoPayRequest) returns (CancelGoPayResponse);
 }

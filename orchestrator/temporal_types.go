@@ -36,6 +36,7 @@ type RegisterActivityOutput struct {
 	AccessToken       string
 	DeviceID          string
 	PlusTrialEligible bool
+	PlusTrialChecked  bool
 	CheckoutURL       string
 	Data              map[string]any
 }
@@ -48,22 +49,45 @@ type GoPayActivityInput struct {
 }
 
 type GoPayActivityOutput struct {
-	ChargeRef string
-	SnapToken string
-	Data      map[string]any
+	ChargeRef         string
+	SnapToken         string
+	PlusTrialEligible bool
+	PlusTrialChecked  bool
+	Data              map[string]any
+}
+
+type ProbePlusTrialActivityInput struct {
+	JobID     string
+	AccountID string
+}
+
+type ProbePlusTrialActivityOutput struct {
+	Success           bool
+	Checked           bool
+	PlusTrialEligible bool
+	Amount            int64
+	Currency          string
+	Source            string
+	CheckoutURL       string
+	ErrorMessage      string
+	Data              map[string]any
 }
 
 type PersistRegisteredInput struct {
-	AccountID    string
-	SessionToken string
-	AccessToken  string
+	AccountID         string
+	SessionToken      string
+	AccessToken       string
+	PlusTrialEligible bool
+	PlusTrialChecked  bool
 }
 
 type PersistActivatedInput struct {
-	AccountID    string
-	SessionToken string
-	AccessToken  string
-	ChargeRef    string
+	AccountID         string
+	SessionToken      string
+	AccessToken       string
+	ChargeRef         string
+	PlusTrialEligible bool
+	PlusTrialChecked  bool
 }
 
 type JobFailureInput struct {
@@ -79,6 +103,41 @@ type JobFailureInput struct {
 type JobSuccessInput struct {
 	JobID  string
 	Result map[string]any
+}
+
+type MailboxRegistrationActivityInput struct {
+	JobID      string
+	Enabled    bool
+	ImportOnly bool
+}
+
+type MailboxRegistrationActivityOutput struct {
+	Success      bool
+	ExitCode     int32
+	ErrorMessage string
+	Mailboxes    []RegisteredMailboxResult
+	Data         map[string]any
+}
+
+type RegisteredMailboxResult struct {
+	EmailAddress string
+	Status       string
+}
+
+type MailboxOAuthActivityInput struct {
+	JobID        string
+	EmailAddress string
+	OnlyMissing  bool
+	Limit        int32
+}
+
+type MailboxOAuthActivityOutput struct {
+	Success      bool
+	Processed    int32
+	Succeeded    int32
+	Failed       int32
+	ErrorMessage string
+	Data         map[string]any
 }
 
 type RegisterAccountWorkflowInput struct {
@@ -109,6 +168,23 @@ type ActivateAccountWorkflowResult struct {
 	SnapToken    string
 }
 
+type ProbePlusTrialWorkflowInput struct {
+	JobID     string
+	AccountID string
+}
+
+type ProbePlusTrialWorkflowResult struct {
+	JobID             string
+	Success           bool
+	Checked           bool
+	PlusTrialEligible bool
+	Amount            int64
+	Currency          string
+	Source            string
+	CheckoutURL       string
+	ErrorMessage      string
+}
+
 type RegisterAndActivateWorkflowInput struct {
 	JobID   string
 	Account AccountSpec
@@ -124,4 +200,33 @@ type RegisterAndActivateWorkflowResult struct {
 	ErrorMessage      string
 	ChargeRef         string
 	SnapToken         string
+}
+
+type RegisterMailboxWorkflowInput struct {
+	JobID      string
+	ImportOnly bool
+}
+
+type RegisterMailboxWorkflowResult struct {
+	JobID        string
+	Success      bool
+	ExitCode     int32
+	ErrorMessage string
+	Mailboxes    []RegisteredMailboxResult
+}
+
+type MailboxOAuthWorkflowInput struct {
+	JobID        string
+	EmailAddress string
+	OnlyMissing  bool
+	Limit        int32
+}
+
+type MailboxOAuthWorkflowResult struct {
+	JobID        string
+	Success      bool
+	Processed    int32
+	Succeeded    int32
+	Failed       int32
+	ErrorMessage string
 }
