@@ -93,6 +93,17 @@ LINK_BYPASS_BODY_HINTS = (
 )
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 MIDTRANS_STATUS_POLL_LIMIT = 12
+RETRYABLE_TRANSPORT_HINTS = (
+    "tls connect error",
+    "connection reset",
+    "connection aborted",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "network is unreachable",
+    "proxy",
+    "eof",
+)
 
 
 # ──────────────────────────── exceptions ──────────────────────────
@@ -112,6 +123,39 @@ class GoPayOTPRejected(GoPayError):
 
 class GoPayPINRejected(GoPayError):
     pass
+
+
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in RETRYABLE_TRANSPORT_HINTS)
+
+
+def _request_with_retries(
+    session: Any,
+    method: str,
+    url: str,
+    *,
+    log: Callable[[str], None],
+    attempts: int = 3,
+    delay_seconds: float = 1.0,
+    **kwargs: Any,
+) -> Any:
+    request = getattr(session, method)
+    host = re.sub(r"^https?://([^/]+).*", r"\1", url)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return request(url, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_retryable_transport_error(exc):
+                raise
+            log(
+                f"[gopay] {method.upper()} {host} transient transport error "
+                f"({attempt}/{attempts}): {type(exc).__name__}: {str(exc)[:160]}"
+            )
+            time.sleep(delay_seconds * attempt)
+    raise last_exc or GoPayError(f"{method.upper()} {host} failed")
 
 
 # ──────────────────────────── core ────────────────────────────────
@@ -232,9 +276,13 @@ class GoPayCharger:
             "client_attribution_metadata[checkout_session_id]": cs_id,
             "key": stripe_pk,
         }
-        r = self.ext.post(
+        r = _request_with_retries(
+            self.ext,
+            "post",
             "https://api.stripe.com/v1/payment_methods",
-            data=body, timeout=DEFAULT_TIMEOUT,
+            data=body,
+            timeout=DEFAULT_TIMEOUT,
+            log=self.log,
         )
         r.raise_for_status()
         pm_id = r.json().get("id", "")
@@ -258,9 +306,13 @@ class GoPayCharger:
             "elements_options_client[stripe_js_locale]": "auto",
             "key": stripe_pk,
         }
-        r = self.ext.post(
+        r = _request_with_retries(
+            self.ext,
+            "post",
             f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
-            data=body, timeout=DEFAULT_TIMEOUT,
+            data=body,
+            timeout=DEFAULT_TIMEOUT,
+            log=self.log,
         )
         r.raise_for_status()
         data = r.json() or {}
@@ -292,6 +344,14 @@ class GoPayCharger:
     def _stripe_confirm(self, cs_id: str, pm_id: str, stripe_pk: str) -> dict:
         init_data = self._stripe_init(cs_id, stripe_pk)
         init_checksum = init_data.get("init_checksum", "")
+        expected_amount, expected_amount_source = _resolve_expected_amount(
+            init_data,
+            self.runtime,
+        )
+        self.log(
+            f"[gopay] stripe expected_amount={expected_amount} "
+            f"source={expected_amount_source}"
+        )
         # Stripe 需要 return_url 才会把 checkout 推进到 requires_action（带 setup_intent）
         chatgpt_return = (
             f"https://chatgpt.com/checkout/verify?stripe_session_id={cs_id}"
@@ -309,7 +369,7 @@ class GoPayCharger:
             "payment_method": pm_id,
             "init_checksum": init_checksum,
             "version": self.runtime.get("version") or "fed52f3bc6",
-            "expected_amount": "0",
+            "expected_amount": expected_amount,
             "expected_payment_method_type": "gopay",
             "return_url": return_url,
             "elements_session_client[session_id]": f"elements_session_{uuid.uuid4().hex[:11]}",
@@ -328,9 +388,13 @@ class GoPayCharger:
             body["js_checksum"] = self.runtime["js_checksum"]
         if self.runtime.get("rv_timestamp"):
             body["rv_timestamp"] = self.runtime["rv_timestamp"]
-        r = self.ext.post(
+        r = _request_with_retries(
+            self.ext,
+            "post",
             f"https://api.stripe.com/v1/payment_pages/{cs_id}/confirm",
-            data=body, timeout=DEFAULT_TIMEOUT,
+            data=body,
+            timeout=DEFAULT_TIMEOUT,
+            log=self.log,
         )
         if (
             r.status_code == 400
@@ -339,11 +403,22 @@ class GoPayCharger:
         ):
             self.log("[gopay] Stripe confirm requires ToS consent; retrying once")
             body["consent[terms_of_service]"] = "accepted"
-            r = self.ext.post(
+            r = _request_with_retries(
+                self.ext,
+                "post",
                 f"https://api.stripe.com/v1/payment_pages/{cs_id}/confirm",
-                data=body, timeout=DEFAULT_TIMEOUT,
+                data=body,
+                timeout=DEFAULT_TIMEOUT,
+                log=self.log,
             )
         if r.status_code != 200:
+            detail = _stripe_confirm_error_detail(
+                r.text,
+                expected_amount=expected_amount,
+                expected_amount_source=expected_amount_source,
+            )
+            if detail:
+                raise GoPayError(detail)
             raise GoPayError(f"stripe confirm {r.status_code}: {r.text[:400]}")
         data = r.json() or {}
         self.log(
@@ -1025,6 +1100,157 @@ def file_watch_otp_provider(watch_path: Path, timeout: float = 300.0) -> Callabl
         raise OTPCancelled(f"OTP timeout after {timeout}s (file={watch_path})")
 
     return provider
+
+
+_CHECKOUT_AMOUNT_KEYS = (
+    "amount_total",
+    "amount_due",
+    "total_amount",
+    "amount_remaining",
+    "total",
+)
+_CHECKOUT_AMOUNT_EXCLUDED_PATH_PARTS = {
+    "amount_discount",
+    "amount_subtotal",
+    "amount_tax",
+    "discount",
+    "discounts",
+    "display_items",
+    "items",
+    "line_items",
+    "lines",
+    "price",
+    "prices",
+    "subtotal",
+    "tax",
+    "taxes",
+    "unit_amount",
+}
+
+
+def _bool_cfg(cfg: dict, key: str, default: bool = False) -> bool:
+    value = cfg.get(key) if isinstance(cfg, dict) else None
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_stripe_amount(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = str(value).strip()
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return None
+
+
+def _path_has_amount_exclusion(path: tuple[str, ...]) -> bool:
+    for part in path:
+        if part.lower() in _CHECKOUT_AMOUNT_EXCLUDED_PATH_PARTS:
+            return True
+    return False
+
+
+def _iter_checkout_amount_candidates(value: Any, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            child_path = path + (key_text,)
+            normalized_key = key_text.lower()
+            if (
+                normalized_key in _CHECKOUT_AMOUNT_KEYS
+                and not _path_has_amount_exclusion(child_path)
+            ):
+                amount = _parse_stripe_amount(child)
+                if amount is not None:
+                    yield ".".join(child_path), amount
+            if isinstance(child, (dict, list)):
+                yield from _iter_checkout_amount_candidates(child, child_path)
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            if isinstance(child, (dict, list)):
+                yield from _iter_checkout_amount_candidates(child, path + (str(idx),))
+
+
+def _select_checkout_amount(init_data: dict) -> tuple[Optional[int], str]:
+    candidates = list(_iter_checkout_amount_candidates(init_data))
+    if not candidates:
+        return None, "unknown"
+
+    preferred_keys = (
+        "amount_total",
+        "amount_due",
+        "total_amount",
+        "amount_remaining",
+        "total",
+    )
+    preferred_contexts = ("checkout", "session", "invoice", "subscription")
+    for key in preferred_keys:
+        for source, amount in candidates:
+            parts = tuple(source.lower().split("."))
+            if parts[-1] != key:
+                continue
+            if len(parts) == 1 or any(ctx in parts for ctx in preferred_contexts):
+                return amount, source
+    return candidates[0][1], candidates[0][0]
+
+
+def _resolve_expected_amount(init_data: dict, runtime_cfg: Optional[dict]) -> tuple[str, str]:
+    runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    override = runtime_cfg.get("expected_amount")
+    if override not in (None, ""):
+        amount = _parse_stripe_amount(override)
+        if amount is None:
+            raise GoPayError(f"invalid runtime.expected_amount: {override!r}")
+        return str(amount), "runtime.expected_amount"
+
+    amount, source = _select_checkout_amount(init_data)
+    if amount is None:
+        if _bool_cfg(runtime_cfg, "fail_on_unknown_expected_amount", False):
+            raise GoPayError("stripe init did not expose checkout amount; refusing confirm")
+        return "0", "fallback_zero_unknown"
+
+    allow_nonzero = _bool_cfg(
+        runtime_cfg,
+        "allow_nonzero_expected_amount",
+        _bool_cfg(runtime_cfg, "allow_paid_checkout", False),
+    )
+    if amount != 0 and not allow_nonzero:
+        currency = str(init_data.get("currency") or "").upper() or "UNKNOWN"
+        raise GoPayError(
+            f"checkout amount is {amount} {currency} from {source}, not free-trial 0; "
+            "refusing to confirm payment",
+        )
+    return str(amount), source
+
+
+def _stripe_confirm_error_detail(
+    text: str,
+    *,
+    expected_amount: str,
+    expected_amount_source: str,
+) -> str:
+    try:
+        payload = json.loads(text or "{}")
+    except Exception:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    if error.get("code") != "checkout_amount_mismatch":
+        return ""
+    message = str(error.get("message") or "checkout amount mismatch")
+    return (
+        "stripe confirm checkout_amount_mismatch: "
+        f"sent expected_amount={expected_amount} from {expected_amount_source}; "
+        f"{message}. This usually means the checkout/latest invoice amount changed "
+        "after the session was created, or another checkout was created for the same account. "
+        f"stripe_error={text[:400]}"
+    )
 
 
 def _clean_otp_candidate(value: Any) -> str:
