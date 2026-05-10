@@ -4,6 +4,7 @@ import {
   Activity,
   Copy,
   Database,
+  Download,
   Eye,
   EyeOff,
   Inbox,
@@ -339,6 +340,9 @@ function App() {
           <p>账号、注册、激活和 GoPay 工作流控制台</p>
         </div>
         <div className="topbarActions">
+          <a className="secondaryButton downloadLink" href="/downloads/whatsapp-forwarder.apk" download>
+            <Download size={16} /> WhatsApp APK
+          </a>
           <button className="primaryButton" onClick={refresh} disabled={busy}>
             <RefreshCcw size={16} /> 刷新
           </button>
