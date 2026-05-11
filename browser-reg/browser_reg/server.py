@@ -93,7 +93,9 @@ class BrowserFlow:
 
     def _wait_for_otp(self, timeout: int | None = None) -> str:
         del timeout
-        self.otp_issued_after_unix = self.started_at_unix or int(time.time())
+        # Second OTP page just appeared → OpenAI just sent a new email.
+        # Filter out any earlier (now-invalid) codes.
+        self.otp_issued_after_unix = int(time.time())
         self._otp_required_event.set()
         logger.info("[browser-reg] waiting orchestrator-supplied OTP flow=%s email=%s", self.flow_id, self.safe_email)
         while not self._otp_event.wait(0.25):

@@ -123,7 +123,7 @@ services:
       - "${ORCHESTRATOR_GRPC_PORT:-50055}:50051" # API
     environment:
       - LISTEN_ADDR=:50051
-      - BROWSER_ADDR=browser-reg:50051
+      - BROWSER_ADDR=${BROWSER_ADDR:-browser-reg:50051}
       - PAYMENT_ADDR=${PAYMENT_ADDR:-gopay-payment:50051}
       - ACCOUNT_DB_ADDR=account-db:50051
       - EMAIL_ADDR=outlook-imap-service:50051

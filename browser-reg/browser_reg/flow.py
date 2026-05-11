@@ -422,7 +422,7 @@ def browser_register(
                 )
             except Exception:
                 pass
-            sleep(3)
+            sleep(0.5)
 
             clicked_signup = False
             for sel in [
@@ -510,31 +510,32 @@ def browser_register(
                     b.click()
                     logger.info(f"[browser-reg] Email continue: {sel}")
                     break
-            sleep(3)
+            sleep(0.5)
 
             # --- [3] Email-verification page → switch to password flow ---
             # 2026 flow: after email submit on chatgpt.com, it redirects to
             # auth.openai.com/email-verification with OTP input + "Continue with password" button.
             # We click "Continue with password" to skip first OTP.
             logger.info("[browser-reg] Waiting for auth.openai.com redirect ...")
-            for wait_i in range(40):
-                sleep(1)
-                cur = page.url
-                if "auth.openai.com" in cur:
-                    logger.info(f"[browser-reg] Reached auth page: {sanitize_url_for_log(cur)}")
-                    break
-                if wait_i == 20:
-                    page.screenshot(path=f"{screenshot_dir}/wait20.png")
-                    logger.info(f"[browser-reg] 20s still waiting, URL: {sanitize_url_for_log(cur, 80)}")
+            try:
+                page.wait_for_url("**/auth.openai.com/**", timeout=30000)
+            except Exception:
+                pass
+            logger.info(f"[browser-reg] Reached auth page: {sanitize_url_for_log(page.url)}")
 
-            # Wait for OTP input or password link to appear
-            sleep(2)
-            logger.info(f"[browser-reg] Post-email URL: {sanitize_url_for_log(page.url)}")
-            page.screenshot(path=f"{screenshot_dir}/before_password_switch.png")
-
-            # Click "Continue with password" button to skip first OTP
+            # Click "Continue with password" as soon as it appears
             if not page.query_selector('input[type="password"]:visible'):
                 switched = False
+                # Wait for the link to render
+                try:
+                    page.wait_for_selector(
+                        'a:has-text("Continue with password"), button:has-text("Continue with password"), '
+                        'a:has-text("Use password"), button:has-text("Use password"), '
+                        'input[type="password"]',
+                        state="visible", timeout=15000,
+                    )
+                except Exception:
+                    pass
                 for sel in [
                     'button:has-text("Continue with password")',
                     'a:has-text("Continue with password")',
@@ -578,8 +579,6 @@ def browser_register(
                     page.screenshot(path=f"{screenshot_dir}/no_password_link.png")
                     logger.warning("[browser-reg] Could not find 'Continue with password' button")
 
-                sleep(3)
-
             # --- [4] Set password ---
             logger.info("[browser-reg] Waiting for password field ...")
             try:
@@ -607,7 +606,7 @@ def browser_register(
                 logger.warning(f"[browser-reg] Password field not found: {sanitize_text(e)}")
                 page.screenshot(path=f"{screenshot_dir}/no_password.png")
 
-            sleep(3)
+            sleep(1)
             logger.info(f"[browser-reg] Post-password URL: {sanitize_url_for_log(page.url)}")
 
             # --- [5] Second OTP (after password, for email verification) ---
@@ -724,15 +723,14 @@ def browser_register(
                         if _safe_click(b, "OTP continue"):
                             logger.info(f"[browser-reg] OTP continue: {sel}")
                             break
-                sleep(4)
+                sleep(1)
 
-            sleep(3)
+            sleep(1)
 
             # --- [6] /about-you: Full name + Birthday ---
             logger.info(f"[browser-reg] Post-OTP URL: {sanitize_url_for_log(page.url)}")
-            sleep(5)
 
-            for _ in range(20):
+            for _ in range(30):
                 sleep(1)
                 if "about-you" in page.url or "chatgpt.com" in page.url:
                     break

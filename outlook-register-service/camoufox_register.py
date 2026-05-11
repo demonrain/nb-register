@@ -470,7 +470,7 @@ def _handle_captcha(page, max_retries=3) -> bool:
 
             # Step 1: Click accessible challenge button
             logger.info("[captcha] Looking for accessible challenge (attempt %d/%d)...", attempt + 1, max_retries)
-            acc_btn = _find_in_any_frame(accessible_sel, timeout=10000)
+            acc_btn = _find_in_any_frame(accessible_sel, timeout=5000)
             if acc_btn:
                 try:
                     _click_with_bezier(page, acc_btn, hold_ms=0)
@@ -485,7 +485,7 @@ def _handle_captcha(page, max_retries=3) -> bool:
             # Step 2: Click the action button
             page.wait_for_timeout(random.randint(300, 600))
             logger.info("[captcha] Looking for action button...")
-            press_btn = _find_in_any_frame(press_sel, timeout=10000)
+            press_btn = _find_in_any_frame(press_sel, timeout=5000)
             if not press_btn:
                 logger.warning("[captcha] No action button found, retrying...")
                 continue
@@ -520,7 +520,7 @@ def _handle_captcha(page, max_retries=3) -> bool:
             try:
                 logger.info("[captcha] Checking result, waiting for loading indicator...")
                 page.locator('[role="status"][aria-label="正在加载..."]').wait_for(timeout=5000)
-                page.wait_for_timeout(8000)
+                page.locator('[role="status"][aria-label="正在加载..."]').wait_for(state="detached", timeout=15000)
 
                 if page.get_by_text('一些异常活动').count() > 0 or page.get_by_text('此站点正在维护').count() > 0:
                     logger.error("[captcha] Rate limited")
@@ -802,7 +802,7 @@ def outlook_register(
                     logger.info("[outlook] ✅ Registration successful (no CAPTCHA): %s", full_email)
                     return result
                 # Wait briefly and re-check (page might be transitioning)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1000)
                 current_url = page.url
                 if 'outlook.live.com/mail' in current_url or 'outlook.office.com' in current_url:
                     logger.info("[outlook] No CAPTCHA detected after wait - registration successful!")
