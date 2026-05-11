@@ -866,6 +866,7 @@ func (s *orchestratorServer) RegisterMailbox(ctx context.Context, req *pb.Regist
 	run, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("register-mailbox-"+jobID), RegisterMailboxWorkflow, RegisterMailboxWorkflowInput{
 		JobID:      jobID,
 		ImportOnly: req.GetImportOnly(),
+		AutoOAuth:  !req.GetImportOnly() && envBool("OUTLOOK_REGISTER_ENABLE_OAUTH2", true),
 	})
 	if err != nil {
 		return nil, err

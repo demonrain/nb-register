@@ -229,6 +229,7 @@ type RegisterAndActivateWorkflowResult struct {
 type RegisterMailboxWorkflowInput struct {
 	JobID      string
 	ImportOnly bool
+	AutoOAuth  bool
 }
 
 type RegisterMailboxWorkflowResult struct {

@@ -427,85 +427,6 @@ def new_or_updated_records(before: dict[str, MailboxRecord], after: list[Mailbox
     return changed
 
 
-def records_with_oauth_results(records: list[MailboxRecord], oauth_result: dict) -> list[MailboxRecord]:
-    token_records: dict[str, MailboxRecord] = {}
-    for item in oauth_result.get("results", []):
-        email = str(item.get("email_address") or item.get("email") or "").strip().lower()
-        refresh_token = str(item.get("refresh_token") or "").strip()
-        if not bool(item.get("success")) or not email or not refresh_token:
-            continue
-        token_records[email] = MailboxRecord(
-            email=email,
-            password=str(item.get("password") or "").strip(),
-            refresh_token=refresh_token,
-            access_token=str(item.get("access_token") or "").strip(),
-            source=str(item.get("source") or "oauth").strip() or "oauth",
-        )
-
-    merged: list[MailboxRecord] = []
-    for record in records:
-        token_record = token_records.get(record.email)
-        if token_record is None:
-            merged.append(record)
-            continue
-        if not token_record.password:
-            token_record = MailboxRecord(
-                email=token_record.email,
-                password=record.password,
-                refresh_token=token_record.refresh_token,
-                access_token=token_record.access_token,
-                source=token_record.source,
-            )
-        merged.append(token_record)
-    return merged
-
-
-def run_auto_oauth_for_records(records: list[MailboxRecord]) -> tuple[list[MailboxRecord], dict]:
-    summary = {
-        "enabled": env_bool("OUTLOOK_REGISTER_ENABLE_OAUTH2", True),
-        "processed": 0,
-        "succeeded": 0,
-        "failed": 0,
-        "error_message": "",
-    }
-    if not summary["enabled"]:
-        return records, summary
-
-    targets = [record for record in records if record.email and record.password and not record.refresh_token]
-    if not targets:
-        return records, summary
-
-    logger.info("starting automatic mailbox OAuth for %d newly registered mailbox(es)", len(targets))
-    try:
-        oauth_result = run_oauth(
-            only_missing=True,
-            limit=len(targets),
-            accounts=targets,
-        )
-        if not isinstance(oauth_result, dict):
-            raise TypeError("mailbox OAuth returned non-dict result")
-        summary["processed"] = int(oauth_result.get("processed", 0))
-        summary["succeeded"] = int(oauth_result.get("succeeded", 0))
-        summary["failed"] = int(oauth_result.get("failed", 0))
-        summary["error_message"] = str(oauth_result.get("error_message") or "")
-        updated = records_with_oauth_results(records, oauth_result)
-    except Exception as exc:
-        logger.exception("automatic mailbox OAuth failed")
-        summary["processed"] = len(targets)
-        summary["failed"] = len(targets)
-        summary["error_message"] = str(exc)
-        return records, summary
-
-    if summary["failed"]:
-        logger.warning(
-            "automatic mailbox OAuth failed for %s/%s mailbox(es): %s",
-            summary["failed"],
-            summary["processed"],
-            summary["error_message"],
-        )
-    return updated, summary
-
-
 def _mailbox_record_from_value(value) -> MailboxRecord:
     if isinstance(value, MailboxRecord):
         return value
@@ -538,14 +459,107 @@ def append_token_record(record: MailboxRecord) -> None:
         )
 
 
+def run_oauth_worker(
+    email: str,
+    password: str,
+    proxy: str,
+    client_id: str,
+    redirect_url: str,
+    scopes: list[str],
+) -> dict:
+    timeout = env_int("OUTLOOK_REGISTER_OAUTH_TIMEOUT_SECONDS", 90)
+    payload = {
+        "email": email,
+        "password": password,
+        "proxy": proxy,
+        "client_id": client_id,
+        "redirect_url": redirect_url,
+        "scopes": scopes,
+    }
+    script_path = Path("/app/register_provider.py")
+    if not script_path.exists():
+        script_path = Path(__file__).resolve()
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(script_path), "oauth-worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd=str(script_path.parent),
+        env=browser_subprocess_env(proxy),
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = process.communicate(json.dumps(payload), timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        terminate_process_group(process.pid)
+        try:
+            stdout, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout = ""
+        return {
+            "success": False,
+            "email": email,
+            "refresh_token": "",
+            "access_token": "",
+            "error": f"OAuth worker timed out after {timeout}s",
+        }
+
+    try:
+        result = json.loads(stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        return {
+            "success": False,
+            "email": email,
+            "refresh_token": "",
+            "access_token": "",
+            "error": f"OAuth worker returned invalid JSON: {exc}; exit_code={process.returncode}",
+        }
+    if not isinstance(result, dict):
+        return {
+            "success": False,
+            "email": email,
+            "refresh_token": "",
+            "access_token": "",
+            "error": "OAuth worker returned non-object JSON",
+        }
+    if process.returncode != 0 and result.get("success"):
+        result["success"] = False
+        result["error"] = str(result.get("error") or f"OAuth worker exited with code {process.returncode}")
+    return result
+
+
+def run_oauth_worker_once() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        from camoufox_register import outlook_oauth
+
+        result = outlook_oauth(
+            email=str(payload.get("email") or ""),
+            password=str(payload.get("password") or ""),
+            proxy=str(payload.get("proxy") or ""),
+            client_id=str(payload.get("client_id") or ""),
+            redirect_url=str(payload.get("redirect_url") or ""),
+            scopes=[str(item) for item in payload.get("scopes") or []],
+        )
+    except Exception as exc:
+        logger.exception("OAuth worker failed")
+        result = {
+            "success": False,
+            "refresh_token": "",
+            "access_token": "",
+            "error": str(exc),
+        }
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
 def run_oauth(
     email_address: str = "",
     only_missing: bool = True,
     limit: int = 100,
     accounts: Iterable[MailboxRecord | dict] | None = None,
 ) -> dict:
-    from camoufox_register import outlook_oauth
-
     requested_email = email_address.strip().lower()
     supplied = [_mailbox_record_from_value(account) for account in (accounts or [])]
     if not supplied:
@@ -596,13 +610,16 @@ def run_oauth(
     results = []
     succeeded = 0
     failed = 0
+    failure_messages: list[str] = []
     for target in targets:
         if not target.password:
+            message = "mailbox password is required for OAuth"
             failed += 1
+            failure_messages.append(f"{target.email}: {message}")
             results.append({
                 "email_address": target.email,
                 "success": False,
-                "error_message": "mailbox password is required for OAuth",
+                "error_message": message,
             })
             continue
 
@@ -611,7 +628,7 @@ def run_oauth(
             logger.info("starting mailbox OAuth for %s with proxy %s", redact_email(target.email), redact_proxy(proxy))
         else:
             logger.info("starting mailbox OAuth for %s without proxy", redact_email(target.email))
-        oauth = outlook_oauth(
+        oauth = run_oauth_worker(
             email=target.email,
             password=target.password,
             proxy=proxy,
@@ -634,19 +651,29 @@ def run_oauth(
                 "error_message": "",
             })
         else:
+            message = str(oauth.get("error") or "OAuth failed")
             failed += 1
+            failure_messages.append(f"{target.email}: {message}")
             results.append({
                 "email_address": target.email,
                 "success": False,
-                "error_message": str(oauth.get("error") or "OAuth failed"),
+                "error_message": message,
             })
+
+    error_message = ""
+    if failed:
+        detail = "; ".join(failure_messages[:3])
+        suffix = f"; +{len(failure_messages) - 3} more" if len(failure_messages) > 3 else ""
+        error_message = f"mailbox OAuth failed: {failed}/{len(targets)}"
+        if detail:
+            error_message += f"; {detail}{suffix}"
 
     return {
         "success": failed == 0 and succeeded > 0,
         "processed": len(targets),
         "succeeded": succeeded,
         "failed": failed,
-        "error_message": "" if failed == 0 else f"mailbox OAuth failed: {failed}/{len(targets)}",
+        "error_message": error_message,
         "results": results,
     }
 
@@ -705,8 +732,6 @@ def run_registration_request_locked(enabled: bool, import_only: bool) -> dict:
     code = run_outlook_register(path, proxy=proxy)
     after_records = collect_records(out_dir, include_password_only=True)
     records = new_or_updated_records(before_records, after_records)
-    if records:
-        records, _ = run_auto_oauth_for_records(records)
 
     error_message = ""
     if not records:
@@ -773,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "oauth-worker":
-        return 1
+        return run_oauth_worker_once()
 
     if args.command == "oauth":
         result = run_oauth(email_address=args.email, only_missing=not args.all, limit=args.limit)
