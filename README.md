@@ -109,6 +109,8 @@ Outlook 注册和 OAuth 对代理质量比较敏感，推荐使用代理池：
 
 看板「邮箱注册」用于自动注册 Outlook 邮箱并导入邮箱池，并为新邮箱启动 best-effort OAuth job；看板「邮箱管理」里的 OAuth 按钮用于补跑或手动触发 OAuth，自动登录微软并换取 refresh token。dashboard 不挂 Docker socket，也不执行宿主机命令。
 
+如果 Microsoft 要求验证备用邮箱，可以在 `outlook-register-service/register-results/` 写入 `oauth_proof_email_<email>.txt` 和 `oauth_code_<email>.txt`，分别填完整备用邮箱和验证码；也可用 `oauth_proof_email.txt` / `oauth_code.txt` 作为临时全局输入。
+
 注册过程日志：
 
 ```bash

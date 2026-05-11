@@ -195,6 +195,52 @@ def _oauth_code_from_url(current_url: str) -> tuple[str, str]:
     return params.get("code", [""])[0], ""
 
 
+def _safe_email_file_part(email: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", email.strip().lower())
+
+
+def _read_manual_oauth_value(kind: str, email: str, results_dir: str) -> str:
+    if kind == "proof_email":
+        env_names = ["OUTLOOK_REGISTER_OAUTH_PROOF_EMAIL"]
+        file_env_names = ["OUTLOOK_REGISTER_OAUTH_PROOF_EMAIL_FILE"]
+        file_names = [
+            f"oauth_proof_email_{_safe_email_file_part(email)}.txt",
+            "oauth_proof_email.txt",
+        ]
+    else:
+        env_names = ["OUTLOOK_REGISTER_OAUTH_VERIFICATION_CODE", "OUTLOOK_REGISTER_OAUTH_CODE"]
+        file_env_names = ["OUTLOOK_REGISTER_OAUTH_VERIFICATION_CODE_FILE", "OUTLOOK_REGISTER_OAUTH_CODE_FILE"]
+        file_names = [
+            f"oauth_code_{_safe_email_file_part(email)}.txt",
+            "oauth_code.txt",
+        ]
+
+    for name in env_names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+
+    candidate_paths = []
+    for name in file_env_names:
+        path = os.environ.get(name, "").strip()
+        if path:
+            candidate_paths.append(path)
+    if results_dir:
+        candidate_paths.extend(str(os.path.join(results_dir, name)) for name in file_names)
+
+    for path in candidate_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+                if value:
+                    return value.splitlines()[0].strip()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("[oauth] failed to read manual %s file %s: %s", kind, path, exc)
+    return ""
+
+
 def _pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -209,6 +255,7 @@ def _complete_microsoft_oauth_page(
     redirect_url: str,
     timeout=160,
     captured_url_fn: Callable[[], str] | None = None,
+    results_dir: str = "",
 ) -> tuple[str, str]:
     deadline = time.time() + timeout
     last_url = ""
@@ -236,11 +283,82 @@ def _complete_microsoft_oauth_page(
 
         progressed = False
 
+        try:
+            proof_input = _first_visible_locator(page, [
+                '#proof-confirmation-email-input',
+                'input[name="proofConfirmationEmail"]',
+                'input[aria-label*="Email"]',
+                'input[aria-label*="电子邮件"]',
+            ], timeout=700)
+            proof_email = _read_manual_oauth_value("proof_email", email, results_dir)
+            if proof_email:
+                _type_into(proof_input, proof_email)
+                _click_first_if_visible(page, [
+                    'button[type="submit"]',
+                    'button:has-text("Send code")',
+                    'button:has-text("发送验证码")',
+                ], timeout=3000)
+                progressed = True
+            elif not _click_first_if_visible(page, [
+                'button:has-text("使用密码")',
+                'button:has-text("Use password")',
+                'button:has-text("Use your password")',
+                '[role="button"]:has-text("使用密码")',
+                '[role="button"]:has-text("Use password")',
+                '[role="button"]:has-text("Use your password")',
+            ], timeout=700):
+                return "", (
+                    "NEEDS_MANUAL_VERIFICATION: Microsoft asked to verify recovery email; "
+                    "provide OUTLOOK_REGISTER_OAUTH_PROOF_EMAIL or oauth_proof_email_<email>.txt"
+                )
+            else:
+                progressed = True
+        except Exception:
+            pass
+
+        try:
+            code_input = _first_visible_locator(page, [
+                'input[name="otc"]',
+                '#idTxtBx_SAOTCC_OTC',
+                'input[autocomplete="one-time-code"]',
+                'input[aria-label*="code"]',
+                'input[aria-label*="Code"]',
+                'input[aria-label*="代码"]',
+            ], timeout=700)
+            verification_code = _read_manual_oauth_value("verification_code", email, results_dir)
+            if not verification_code:
+                return "", (
+                    "NEEDS_MANUAL_VERIFICATION: Microsoft asked for email verification code; "
+                    "provide OUTLOOK_REGISTER_OAUTH_VERIFICATION_CODE or oauth_code_<email>.txt"
+                )
+            _type_into(code_input, verification_code)
+            _click_first_if_visible(page, [
+                'button[type="submit"]',
+                '#idSubmit_SAOTCC_Continue',
+                '#idSIButton9',
+                'button:has-text("Verify")',
+                'button:has-text("Next")',
+                'button:has-text("验证")',
+                'button:has-text("下一步")',
+            ], timeout=3000)
+            progressed = True
+        except Exception:
+            pass
+
+        if _click_first_if_visible(page, [
+            'button:has-text("使用密码")',
+            'button:has-text("Use password")',
+            'button:has-text("Use your password")',
+            '[role="button"]:has-text("使用密码")',
+            '[role="button"]:has-text("Use password")',
+            '[role="button"]:has-text("Use your password")',
+        ], timeout=700):
+            progressed = True
+
         if _click_first_if_visible(page, [
             f'[data-test-id="{email}"]',
             f'[aria-label*="{email}"]',
             f'div[role="button"]:has-text("{email}")',
-            f'div:has-text("{email}")',
         ], timeout=700):
             progressed = True
 
@@ -367,7 +485,8 @@ def outlook_oauth(
         with Camoufox(
             headless=headless, humanize=True, persistent_context=True,
             user_data_dir=tmp_profile, screen=Screen(max_width=1920, max_height=1080),
-            proxy=cf_proxy, geoip=True, locale="zh-CN",
+            proxy=cf_proxy, geoip=True,
+            locale=os.environ.get("OUTLOOK_REGISTER_OAUTH_LOCALE", "en-US").strip() or "en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             captured_url = ""
@@ -386,6 +505,7 @@ def outlook_oauth(
                     password,
                     redirect_url,
                     captured_url_fn=lambda: captured_url,
+                    results_dir=ss_dir,
                 )
             finally:
                 try:
