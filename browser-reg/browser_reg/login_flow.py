@@ -11,7 +11,12 @@ from urllib.parse import urlparse
 from browserforge.fingerprints import Screen
 from camoufox.sync_api import Camoufox
 
-from browser_reg.flow import BrowserRegistrationCancelled, cleanup_stale_browser_profiles
+from browser_reg.cookies import extract_session_token
+from browser_reg.flow import (
+    BrowserRegistrationCancelled,
+    _is_playwright_target_closed_error,
+    cleanup_stale_browser_profiles,
+)
 from browser_reg.sensitive import redact_email, sanitize_text, sanitize_url_for_log
 
 logger = logging.getLogger(__name__)
@@ -83,9 +88,67 @@ def browser_login(
     def sleep(seconds: float) -> None:
         _interruptible_sleep(float(seconds), check_cancel)
 
+    ctx = None
+    page = None
+
+    def active_page():
+        nonlocal page
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception as e:
+                if not _is_playwright_target_closed_error(e):
+                    raise
+
+        if ctx is None:
+            raise RuntimeError("browser context is not available")
+
+        try:
+            pages = [p for p in ctx.pages if not p.is_closed()]
+        except Exception as e:
+            raise RuntimeError(f"browser context is closed: {sanitize_text(e)}") from e
+        if not pages:
+            raise RuntimeError("browser page closed and no replacement page is available")
+
+        page = pages[-1]
+        logger.info("[browser-reg] Switched to active login browser page")
+        return page
+
+    def with_active_page(action):
+        nonlocal page
+        last_error = None
+        for attempt in range(2):
+            try:
+                return action(active_page())
+            except Exception as e:
+                if attempt == 0 and _is_playwright_target_closed_error(e):
+                    last_error = e
+                    page = None
+                    continue
+                raise
+        raise last_error
+
+    def query_selector(selector: str):
+        return with_active_page(lambda p: p.query_selector(selector))
+
+    def page_url() -> str:
+        return with_active_page(lambda p: p.url)
+
+    def page_evaluate(script: str, *args):
+        return with_active_page(lambda p: p.evaluate(script, *args))
+
+    def page_screenshot(path: str) -> bool:
+        try:
+            with_active_page(lambda p: p.screenshot(path=path))
+            return True
+        except Exception as e:
+            logger.info("[browser-reg] Login screenshot failed: %s", sanitize_text(e))
+            return False
+
     def safe_click(element, label: str, timeout: int = 5000) -> bool:
         try:
-            element.click(timeout=timeout)
+            element.click(timeout=timeout, force=True)
             return True
         except Exception as e:
             logger.info("[browser-reg] %s click failed, trying JS click: %s", label, sanitize_text(e))
@@ -130,7 +193,7 @@ def browser_login(
             'input[type="text"]:visible',
         ]:
             try:
-                el = page.query_selector(sel)
+                el = query_selector(sel)
                 if el and el.is_visible():
                     return el
             except Exception:
@@ -146,7 +209,7 @@ def browser_login(
             'input[type="text"]:visible',
         ]:
             try:
-                el = page.query_selector(sel)
+                el = query_selector(sel)
                 if el and el.is_visible():
                     return el
             except Exception:
@@ -161,7 +224,7 @@ def browser_login(
             'a:has-text("Log in")',
         ]:
             try:
-                btn = page.query_selector(sel)
+                btn = query_selector(sel)
                 if btn and btn.is_visible() and safe_click(btn, "Login"):
                     logger.info("[browser-reg] Clicked login: %s", sel)
                     return True
@@ -190,14 +253,14 @@ def browser_login(
             'a:has-text("Password")',
         ]:
             try:
-                el = page.query_selector(sel)
+                el = query_selector(sel)
                 if el and el.is_visible() and safe_click(el, "Login password flow"):
                     logger.info("[browser-reg] Switched login to password flow: %s", sel)
                     return True
             except Exception:
                 continue
         try:
-            return bool(page.evaluate('''() => {
+            return bool(page_evaluate('''() => {
                 const els = document.querySelectorAll('a, button, div[role="button"]');
                 for (const el of els) {
                     const t = (el.textContent || '').trim().toLowerCase();
@@ -226,14 +289,15 @@ def browser_login(
             if not otp_input or not fill_input(otp_input, otp_code):
                 raise RuntimeError("login OTP input not found")
         for sel in ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Verify")']:
-            b = page.query_selector(sel)
+            b = query_selector(sel)
             if b and b.is_visible() and safe_click(b, "Login OTP continue"):
                 break
         return wait_for_session("login-otp-submit", seconds=15)
 
     def capture_session_state(label: str) -> bool:
+        session_info = {}
         try:
-            session_info = page.evaluate(
+            session_info = page_evaluate(
                 """async () => {
                     const controller = new AbortController();
                     const timer = setTimeout(() => controller.abort(), 8000);
@@ -250,7 +314,15 @@ def browser_login(
             )
         except Exception as e:
             logger.info("[browser-reg] Login session fetch failed at %s: %s", label, sanitize_text(e))
-            return False
+
+        if not (isinstance(session_info, dict) and session_info.get("accessToken")):
+            try:
+                direct_resp = ctx.request.get("https://chatgpt.com/api/auth/session", timeout=15000)
+                direct_info = direct_resp.json() if direct_resp.ok else {}
+                if isinstance(direct_info, dict):
+                    session_info = direct_info
+            except Exception as e:
+                logger.info("[browser-reg] Login session page read failed at %s: %s", label, sanitize_text(e))
 
         if isinstance(session_info, dict) and session_info.get("accessToken"):
             result["access_token"] = session_info.get("accessToken", "")
@@ -261,10 +333,14 @@ def browser_login(
             logger.info("[browser-reg] Login cookie capture failed at %s: %s", label, sanitize_text(e))
             cookies = []
         chatgpt_cookies = [c for c in cookies if "chatgpt.com" in c.get("domain", "")]
+        if _env_bool("BROWSER_REG_DEBUG", False):
+            logger.info(
+                "[browser-reg] Login cookie names: %s",
+                ", ".join(sorted({str(c.get("name", "")) for c in chatgpt_cookies if c.get("name")})),
+            )
+        result["session_token"] = extract_session_token(chatgpt_cookies)
         for c in chatgpt_cookies:
             name = c["name"]
-            if name == "__Secure-next-auth.session-token":
-                result["session_token"] = c["value"]
             if name in ("oai-did", "oai-device-id"):
                 result["device_id"] = c["value"]
             if name == "__Host-next-auth.csrf-token":
@@ -278,13 +354,13 @@ def browser_login(
             "yes" if result["access_token"] else "no",
             "yes" if result["device_id"] else "no",
         )
-        return bool(result["session_token"])
+        return bool(result["access_token"] or result["session_token"])
 
     def wait_for_session(label: str, seconds: int = 20) -> bool:
         for _ in range(max(1, seconds)):
             sleep(1)
             try:
-                cur = page.url
+                cur = page_url()
             except Exception:
                 return False
             if "chatgpt.com" in cur and "auth.openai.com" not in cur and capture_session_state(label):
@@ -292,8 +368,11 @@ def browser_login(
         return False
 
     try:
-        headless = "virtual" if _platform.system() == "Linux" else False
+        debug_mode = _env_bool("BROWSER_REG_DEBUG", False)
+        headless = False if debug_mode else ("virtual" if _platform.system() == "Linux" else False)
         geoip_enabled = _env_bool("CAMOUFOX_GEOIP", True)
+        if debug_mode:
+            logger.info("[browser-reg] Debug mode enabled: headless=False")
         with Camoufox(
             headless=headless,
             humanize=True,
@@ -306,29 +385,27 @@ def browser_login(
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             logger.info("[browser-reg] Opening chatgpt.com for login ...")
-            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            with_active_page(lambda p: p.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000))
             sleep(3)
 
             click_login_entry()
             email_input = wait_for_email_input()
             if not email_input or not fill_input(email_input, email):
-                try:
-                    page.screenshot(path=f"{screenshot_dir}/login_no_email.png")
-                except Exception:
-                    pass
+                page_screenshot(path=f"{screenshot_dir}/login_no_email.png")
                 raise RuntimeError("login email input not found")
             for sel in ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")']:
-                b = page.query_selector(sel)
+                b = query_selector(sel)
                 if b and b.is_visible() and safe_click(b, "Login email continue"):
                     break
 
             password_ready = False
             for i in range(60):
                 sleep(1)
-                if page.query_selector('input[type="password"]:visible') or page.query_selector('input[name="password"]:visible'):
+                if query_selector('input[type="password"]:visible') or query_selector('input[name="password"]:visible'):
                     password_ready = True
                     break
-                if "chatgpt.com" in page.url and "auth.openai.com" not in page.url and capture_session_state("login-email-arrival"):
+                cur = page_url()
+                if "chatgpt.com" in cur and "auth.openai.com" not in cur and capture_session_state("login-email-arrival"):
                     return result
                 if click_password_flow():
                     sleep(2)
@@ -339,26 +416,23 @@ def browser_login(
                     sleep(2)
                     continue
                 if i in (15, 30, 45):
-                    logger.info("[browser-reg] Waiting for login password field, URL: %s", sanitize_url_for_log(page.url))
+                    logger.info("[browser-reg] Waiting for login password field, URL: %s", sanitize_url_for_log(page_url()))
 
             if not password_ready:
-                try:
-                    page.screenshot(path=f"{screenshot_dir}/login_no_password.png")
-                except Exception:
-                    pass
+                page_screenshot(path=f"{screenshot_dir}/login_no_password.png")
                 raise RuntimeError("login password input not found")
 
-            pwd_input = page.query_selector('input[type="password"]') or page.query_selector('input[name="password"]')
+            pwd_input = query_selector('input[type="password"]') or query_selector('input[name="password"]')
             if not pwd_input or not fill_input(pwd_input, password):
                 raise RuntimeError("login password input not found")
             for sel in ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")']:
-                b = page.query_selector(sel)
+                b = query_selector(sel)
                 if b and b.is_visible() and safe_click(b, "Login password continue"):
                     break
 
             for i in range(120):
                 sleep(1)
-                cur = page.url
+                cur = page_url()
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur and capture_session_state("login-arrival"):
                     return result
                 if find_otp_input():
@@ -367,10 +441,7 @@ def browser_login(
                 if i in (30, 60):
                     logger.info("[browser-reg] Login wait URL: %s", sanitize_url_for_log(cur))
 
-            try:
-                page.screenshot(path=f"{screenshot_dir}/login_no_session.png")
-            except Exception:
-                pass
+            page_screenshot(path=f"{screenshot_dir}/login_no_session.png")
             raise RuntimeError("login did not produce session")
     finally:
         shutil.rmtree(tmp_profile, ignore_errors=True)

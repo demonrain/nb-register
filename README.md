@@ -25,6 +25,7 @@ GOPAY_COUNTRY_CODE=62
 GOPAY_PHONE_NUMBER=
 GOPAY_PIN=
 GOPAY_PROXY_URL=socks5://host.docker.internal:10813
+GOPAY_SIGNUP_AUTH_UUID=
 ```
 
 启动：
@@ -121,7 +122,7 @@ tail -f outlook-register-service/register-results/register.log
 
 ## GoPay OTP
 
-GoPay payment 内置 OTP webhook。手机端通知转发工具默认把收到的 GoPay OTP POST 到：
+`whatsapp-otp-relay` 统一接收 WhatsApp OTP webhook，并缓存给编排服务通过 gRPC 消费。手机端通知转发工具默认把收到的 GoPay OTP POST 到：
 
 ```text
 http://192.168.0.115:8081/webhook/otp
@@ -141,7 +142,7 @@ cd whatsapp-forwarder
 ```bash
 curl -X POST http://127.0.0.1:8081/webhook/otp \
   -H 'Content-Type: application/json' \
-  -d '{"otp":"123456","source":"phone"}'
+  -d '{"otp":"123456","source":"whatsapp"}'
 ```
 
 也支持纯文本 payload。
@@ -153,7 +154,50 @@ GOPAY_COUNTRY_CODE=62
 GOPAY_PHONE_NUMBER=
 GOPAY_PIN=
 GOPAY_PROXY_URL=socks5://host.docker.internal:10813
+GOPAY_SIGNUP_AUTH_UUID=
 ```
+
+## CheckPhone Telegram Bot
+
+`checkphone-tgbot` 是独立容器，不调用 `gopay-cycle`。它复制了一份号码检测逻辑，通过 Telegram Bot API 长轮询 `getUpdates` 接收消息，再用 `sendMessage` 回复检测结果，所以不需要开放 webhook 端口。
+
+在本地 `.env` 填写：
+
+```env
+TELEGRAM_BOT_TOKEN=
+# 可选：只允许这些 chat id 使用，逗号/空格/换行分隔；留空表示不限制。
+TELEGRAM_ALLOWED_CHAT_IDS=
+# 可选：Telegram API 代理，GoPay 检测仍使用 GOPAY_PROXY_URL。
+TELEGRAM_PROXY=
+```
+
+启动：
+
+```bash
+docker compose --profile tgbot up -d --build checkphone-tgbot
+```
+
+Bot 支持：
+
+```text
+1. 发送 /check-gopay-registered
+2. 按提示发送手机号
+```
+
+手机号支持 `628xxxxxxxxxx`、`8xxxxxxxxxx`、`+62 8xxxxxxxxxx` 这几类格式。手机号必须作为命令后的下一条消息发送。
+
+Telegram 命令菜单本身只允许小写字母、数字和下划线，不能显示 `/check-gopay-registered`，所以菜单只保留 `/help` 说明项。
+
+私有 GoPay 登录命令只允许 `TELEGRAM_OWNER_CHAT_IDS` 中的 chat id 使用。流程：
+
+```text
+/login-gopay
+按提示发送手机号
+按提示发送 PIN
+如需二次验证，按提示发送 OTP
+```
+
+登录成功后 bot 会检查 GoPay Wallet 余额是否大于 `GOPAY_REQUIRED_BALANCE_RP`，默认是 `1` Rp。token 只保存到容器内 `/data/gopay_login_state.json`，不会通过 Telegram 返回。可用 `/gopay-status` 重新检查已保存账号余额，用 `/clear-gopay-login` 清空本地登录状态。
 
 ## 看板操作
 
@@ -163,7 +207,7 @@ GOPAY_PROXY_URL=socks5://host.docker.internal:10813
 - 邮箱注册：自动注册 Outlook 邮箱并导入邮箱池。
 - 邮箱管理：查看邮箱状态，手动导入已有 Outlook 邮箱，或对缺 token 的邮箱执行 OAuth。
 - 注册账号：触发 `browser-reg`，默认最多等待 180 秒获取 Outlook 邮件 OTP；如果邮箱服务没取到码，可以在「工作流详情」对运行中的注册 job 手动提交 OTP。
-- 激活账号：使用账号 session token / access token 触发 GoPay 支付，等待 GoPay OTP webhook 回传。
+- 激活账号：使用账号 session token / access token 触发 GoPay 支付，等待 `whatsapp-otp-relay` 回传 GoPay OTP。
 - 注册并激活：按顺序执行注册和支付。
 - 账号详情：查看/隐藏账号密码，修改 session token。
 - 工作流详情：查看 job 状态、步骤、错误和结果摘要。
@@ -184,6 +228,7 @@ docker compose --env-file compose.env ps
 docker compose --env-file compose.env logs -f orchestrator
 docker compose --env-file compose.env logs -f browser-reg
 docker compose --env-file compose.env logs -f gopay-payment
+docker compose --env-file compose.env logs -f whatsapp-otp-relay
 docker compose --env-file compose.env logs -f outlook-imap-service
 ```
 

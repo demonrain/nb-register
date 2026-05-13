@@ -32,7 +32,18 @@ def _is_target_closed(exc: Exception) -> bool:
     """Check if an exception is a Playwright TargetClosedError by class name."""
     return type(exc).__name__ == "TargetClosedError"
 
-BOT_PROTECTION_WAIT = 11  # seconds
+
+def _page_is_closed(page) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception as exc:
+        logger.debug("[browser] page.is_closed() failed; treating page as still active: %s", exc)
+        return False
+
+try:
+    BOT_PROTECTION_WAIT = max(0, int(os.environ.get("OUTLOOK_REGISTER_BOT_PROTECTION_WAIT", "0")))
+except ValueError:
+    BOT_PROTECTION_WAIT = 0
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +105,8 @@ def _bezier_move(page, x1, y1, x2, y2):
         page.wait_for_timeout(random.randint(4, 16))
 
 
-def _click_with_bezier(page, locator, hold_ms=0):
-    box = locator.bounding_box(timeout=5000)
+def _click_with_bezier(page, locator, hold_ms=0, box_timeout=5000):
+    box = locator.bounding_box(timeout=box_timeout)
     if not box:
         raise TimeoutError("element has no bounding box")
     tx = box["x"] + box["width"] / 2 + random.randint(-5, 5)
@@ -132,28 +143,65 @@ def _first_visible_locator(page, selectors, timeout=10000):
 
 
 def _type_into(locator, value, delay=0):
-    locator.click(timeout=5000, force=True)
+    try:
+        locator.fill("", timeout=3000)
+        locator.fill(value, timeout=10000)
+        return
+    except Exception as fill_exc:
+        last_error = fill_exc
+    try:
+        locator.evaluate(
+            """(el) => {
+                el.focus();
+                if ('value' in el) el.value = '';
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }"""
+        )
+    except Exception as focus_exc:
+        last_error = focus_exc
     try:
         locator.press("Control+A", timeout=2000)
         locator.press("Backspace", timeout=2000)
-    except Exception:
-        locator.fill("", timeout=3000)
-    if delay > 0:
-        locator.type(value, delay=delay, timeout=10000)
-    else:
-        locator.fill(value, timeout=10000)
+    except Exception as press_exc:
+        last_error = press_exc
+    try:
+        if delay > 0:
+            locator.type(value, delay=delay, timeout=10000)
+        else:
+            locator.fill(value, timeout=10000)
+        return
+    except Exception as type_exc:
+        last_error = type_exc
+    raise last_error
 
 
 def _click_primary(page, timeout=10000):
     button = _first_visible_locator(page, [
         '[data-testid="primaryButton"]',
         'button[type="submit"]',
-        'button:has-text("下一步")',
         'button:has-text("Next")',
-        'button:has-text("继续")',
         'button:has-text("Continue")',
     ], timeout=timeout)
-    button.click(timeout=5000, force=True)
+    errors = []
+    actions = [
+        lambda: button.click(timeout=2000),
+        lambda: button.click(timeout=2000, force=True),
+        lambda: button.evaluate("(el) => el.click()"),
+        lambda: button.dispatch_event("click", timeout=1000),
+    ]
+    for action in actions:
+        try:
+            action()
+            return
+        except Exception as exc:
+            errors.append(str(exc))
+            try:
+                if button.count() == 0 or not button.is_visible(timeout=100):
+                    return
+            except Exception:
+                return
+    raise TimeoutError(errors[-1] if errors else "primary button click failed")
 
 
 def _password_input_visible(page) -> bool:
@@ -162,7 +210,6 @@ def _password_input_visible(page) -> bool:
             'input[type="password"]',
             '[name="Password"]',
             '[name="passwd"]',
-            'input[aria-label*="密码"]',
             'input[aria-label*="Password"]',
             'input[autocomplete="new-password"]',
         ], timeout=400)
@@ -183,12 +230,49 @@ def _visible_text_present(page, texts) -> bool:
     return False
 
 
+def _is_mailbox_url(current_url: str) -> bool:
+    lowered = (current_url or "").lower()
+    return (
+        "outlook.live.com/mail" in lowered
+        or "outlook.office.com/mail" in lowered
+        or "outlook.office365.com/mail" in lowered
+    )
+
+
+def _wait_for_mailbox_success(page, timeout=60000) -> bool:
+    deadline = time.time() + timeout / 1000
+    last_url = ""
+    while time.time() < deadline:
+        try:
+            current_url = page.url
+        except Exception as exc:
+            if _is_target_closed(exc):
+                return False
+            raise
+
+        if current_url != last_url:
+            last_url = current_url
+            logger.info("[outlook] Waiting for mailbox page, current url: %s", current_url.split("?", 1)[0])
+
+        if _is_mailbox_url(current_url):
+            return True
+
+        if _visible_text_present(page, [
+            'unusual activity',
+            'temporarily restricted',
+            'site is under maintenance',
+            'site is being maintained',
+            'Try again later',
+            'Something went wrong',
+        ]):
+            return False
+
+        page.wait_for_timeout(1000)
+    return False
+
+
 def _email_unavailable_visible(page) -> bool:
     return _visible_text_present(page, [
-        "该用户名已被占用",
-        "已被占用",
-        "请尝试其他选项",
-        "可用选项",
         "is already taken",
         "already taken",
         "Someone already has",
@@ -268,10 +352,61 @@ def _select_birth_value(page, field_name, value, option_texts):
     except Exception:
         pass
 
-    field.click(timeout=5000, force=True)
-    option_selectors = [f'[role="option"]:text-is("{text}")' for text in option_texts]
-    option_selectors.extend([f'option:text-is("{text}")' for text in option_texts])
-    _first_visible_locator(page, option_selectors, timeout=10000).click(timeout=5000, force=True)
+    def _open_dropdown():
+        errors = []
+        actions = [
+            lambda: field.click(timeout=2000, force=True),
+            lambda: field.evaluate("(el) => el.click()"),
+            lambda: field.press("Enter", timeout=2000),
+            lambda: field.press("Space", timeout=2000),
+            lambda: field.press("Alt+ArrowDown", timeout=2000),
+        ]
+        for action in actions:
+            try:
+                action()
+                page.wait_for_timeout(150)
+                if page.locator('[role="option"]').count() > 0:
+                    return
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise TimeoutError("; ".join(errors[-2:]))
+
+    option_selectors = []
+    for text in option_texts:
+        escaped = str(text).replace('"', '\\"')
+        option_selectors.extend([
+            f'[role="option"]:text-is("{escaped}")',
+            f'[role="option"]:has-text("{escaped}")',
+            f'option:text-is("{escaped}")',
+            f'option:has-text("{escaped}")',
+        ])
+
+    _open_dropdown()
+    try:
+        option = _first_visible_locator(page, option_selectors, timeout=2500)
+        try:
+            option.click(timeout=2000, force=True)
+        except Exception:
+            option.evaluate("(el) => el.click()")
+        return
+    except Exception:
+        pass
+
+    try:
+        index = max(0, int(value) - 1)
+        options = page.locator('[role="option"]')
+        if options.count() > index:
+            option = options.nth(index)
+            try:
+                option.click(timeout=2000, force=True)
+            except Exception:
+                option.evaluate("(el) => el.click()")
+            return
+    except Exception:
+        pass
+
+    raise TimeoutError(f"could not select {field_name}={value}")
 
 
 def _click_first_if_visible(page, selectors, timeout=1000) -> bool:
@@ -387,7 +522,6 @@ def _complete_microsoft_oauth_page(
                 '#proof-confirmation-email-input',
                 'input[name="proofConfirmationEmail"]',
                 'input[aria-label*="Email"]',
-                'input[aria-label*="电子邮件"]',
             ], timeout=700)
             proof_email = _read_manual_oauth_value("proof_email", email, results_dir)
             if proof_email:
@@ -395,14 +529,11 @@ def _complete_microsoft_oauth_page(
                 _click_first_if_visible(page, [
                     'button[type="submit"]',
                     'button:has-text("Send code")',
-                    'button:has-text("发送验证码")',
                 ], timeout=3000)
                 progressed = True
             elif not _click_first_if_visible(page, [
-                'button:has-text("使用密码")',
                 'button:has-text("Use password")',
                 'button:has-text("Use your password")',
-                '[role="button"]:has-text("使用密码")',
                 '[role="button"]:has-text("Use password")',
                 '[role="button"]:has-text("Use your password")',
             ], timeout=700):
@@ -422,7 +553,6 @@ def _complete_microsoft_oauth_page(
                 'input[autocomplete="one-time-code"]',
                 'input[aria-label*="code"]',
                 'input[aria-label*="Code"]',
-                'input[aria-label*="代码"]',
             ], timeout=700)
             verification_code = _read_manual_oauth_value("verification_code", email, results_dir)
             if not verification_code:
@@ -437,18 +567,14 @@ def _complete_microsoft_oauth_page(
                 '#idSIButton9',
                 'button:has-text("Verify")',
                 'button:has-text("Next")',
-                'button:has-text("验证")',
-                'button:has-text("下一步")',
             ], timeout=3000)
             progressed = True
         except Exception:
             pass
 
         if _click_first_if_visible(page, [
-            'button:has-text("使用密码")',
             'button:has-text("Use password")',
             'button:has-text("Use your password")',
-            '[role="button"]:has-text("使用密码")',
             '[role="button"]:has-text("Use password")',
             '[role="button"]:has-text("Use your password")',
         ], timeout=700):
@@ -473,7 +599,6 @@ def _complete_microsoft_oauth_page(
                 'button[type="submit"]',
                 'input[type="submit"]',
                 'button:has-text("Next")',
-                'button:has-text("下一步")',
             ], timeout=3000)
             progressed = True
         except Exception:
@@ -491,8 +616,6 @@ def _complete_microsoft_oauth_page(
                 'button[type="submit"]',
                 'input[type="submit"]',
                 'button:has-text("Sign in")',
-                'button:has-text("登录")',
-                'button:has-text("下一步")',
             ], timeout=3000)
             progressed = True
         except Exception:
@@ -501,10 +624,7 @@ def _complete_microsoft_oauth_page(
         if _click_first_if_visible(page, [
             '[data-testid="appConsentPrimaryButton"]',
             'button:has-text("Accept")',
-            'button:has-text("接受")',
-            'button:has-text("同意")',
             'button:has-text("Continue")',
-            'button:has-text("继续")',
             '#idSIButton9',
             'input[type="submit"]',
         ], timeout=700):
@@ -585,7 +705,7 @@ def outlook_oauth(
             headless=headless, humanize=True, persistent_context=True,
             user_data_dir=tmp_profile, screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy, geoip=True,
-            locale=os.environ.get("OUTLOOK_REGISTER_OAUTH_LOCALE", "en-US").strip() or "en-US",
+            locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             captured_url = ""
@@ -658,130 +778,552 @@ def outlook_oauth(
 # CAPTCHA handler (auto press-and-hold only)
 # ---------------------------------------------------------------------------
 
-def _handle_captcha(page, max_retries=3) -> bool:
+def _handle_captcha(page, max_retries=10) -> bool:
     """Handle CAPTCHA, searching across all frames."""
 
-    def _find_in_any_frame(selectors, timeout=5000):
+    def _find_in_any_frame(selectors, timeout=5000, locator_timeout=120, poll_ms=120):
         """Search for a visible locator across page and all frames."""
         deadline = time.time() + timeout / 1000
         while time.time() < deadline:
-            for frame in page.frames:
+            for frame in _captcha_frames():
+                if time.time() >= deadline:
+                    return None
                 for sel in selectors:
+                    remaining_ms = int((deadline - time.time()) * 1000)
+                    if remaining_ms <= 0:
+                        return None
                     try:
-                        loc = frame.locator(sel)
-                        if loc.count() > 0:
-                            box = loc.first.bounding_box(timeout=500)
-                            if box and box['width'] > 0 and box['height'] > 0:
-                                return loc.first
+                        loc = frame.locator(sel).first
+                        if loc.is_visible(timeout=max(1, min(locator_timeout, remaining_ms))):
+                            return loc
                     except Exception as exc:
                         if _is_target_closed(exc):
-                            raise
-            page.wait_for_timeout(300)
+                            if _page_is_closed(page):
+                                raise
+                            logger.debug("[captcha] frame target closed while searching; retrying")
+                            continue
+            remaining_ms = int((deadline - time.time()) * 1000)
+            if remaining_ms > 0:
+                page.wait_for_timeout(min(poll_ms, remaining_ms))
         return None
 
-    accessible_sel = ['[aria-label="可访问性挑战"]', '[aria-label="Accessible challenge"]']
-    press_sel = ['[aria-label="再次按下"]', '[aria-label*="按住"]',
-                 '[aria-label*="Press and hold"]', '[aria-label*="Press"]']
+    def _captcha_frames():
+        frames = list(page.frames)
+        keywords = (
+            "captcha",
+            "arkose",
+            "funcaptcha",
+            "enforcement",
+            "human",
+            "perimeter",
+            "hsprotect",
+            "px-cloud",
+            "px-cdn",
+        )
+        selected = [frame for frame in frames if any(key in (frame.url or "").lower() for key in keywords)]
+        return selected or frames
+
+    def _find_control_in_any_frame(
+        timeout=15000,
+        exclude=None,
+        kind_filter: Optional[str] = None,
+        action_filter: Optional[str] = None,
+        randomize=False,
+    ):
+        """Find the next clickable CAPTCHA control without slow Playwright selector scans."""
+        deadline = time.time() + timeout / 1000
+        script = """
+        (opts) => {
+            const exclude = opts.exclude || {};
+            const kindFilter = opts.kindFilter || '';
+            const actionFilter = opts.actionFilter || '';
+            const attr = 'data-nb-captcha-control';
+            document.querySelectorAll('[' + attr + '="1"]').forEach((el) => el.removeAttribute(attr));
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none' &&
+                    el.getAttribute('aria-disabled') !== 'true' &&
+                    !el.disabled;
+            };
+            const candidates = Array.from(document.querySelectorAll(
+                'button, a[role="button"], [role="button"], input[type="button"], input[type="submit"], [aria-label]'
+            ));
+            const blocked = (el, kind, text) => {
+                if (exclude &&
+                    exclude.clickId &&
+                    el.getAttribute('data-nb-captcha-click-id') === exclude.clickId &&
+                    kind === exclude.kind &&
+                    text === exclude.text) {
+                    return true;
+                }
+                return false;
+            };
+            const actionType = (text) => {
+                if (/press again|try again/i.test(text)) return 'again';
+                if (/press\\s*&\\s*hold|press and hold/i.test(text)) return 'hold';
+                if (/next|continue/i.test(text)) return 'advance';
+                if (/press/i.test(text)) return 'press';
+                return '';
+            };
+            const matches = [];
+            for (const el of candidates) {
+                if (!visible(el)) continue;
+                const text = [
+                    el.getAttribute('aria-label') || '',
+                    el.innerText || '',
+                    el.value || '',
+                    el.textContent || '',
+                ].join(' ').trim();
+                if (/Human Challenge completed|challenge completed/i.test(text)) continue;
+                if (/Accessible challenge/i.test(text)) {
+                    if (kindFilter !== 'action' && !blocked(el, 'accessible', text)) {
+                        matches.push({el, kind: 'accessible'});
+                    }
+                    continue;
+                }
+                if (/Next|Continue|Press|again/i.test(text)) {
+                    const action = actionType(text);
+                    if (kindFilter !== 'accessible' &&
+                        (!actionFilter || action === actionFilter) &&
+                        !blocked(el, 'action', text)) {
+                        matches.push({el, kind: 'action', action});
+                    }
+                }
+            }
+            let match = null;
+            if (opts.randomize) {
+                const actions = matches.filter((item) => item.kind === 'action');
+                const accessibles = matches.filter((item) => item.kind === 'accessible');
+                const buckets = [];
+                if (actions.length) buckets.push(actions[Math.floor(Math.random() * actions.length)]);
+                if (accessibles.length) buckets.push(accessibles[Math.floor(Math.random() * accessibles.length)]);
+                if (buckets.length) match = buckets[Math.floor(Math.random() * buckets.length)];
+            }
+            if (!match) {
+                match = matches.find((item) => item.kind === 'action') || matches.find((item) => item.kind === 'accessible');
+            }
+            if (match) {
+                match.el.setAttribute(attr, '1');
+                match.el.setAttribute('data-nb-captcha-kind', match.kind);
+                match.el.setAttribute('data-nb-captcha-action', match.action || '');
+                return true;
+            }
+            return false;
+        }
+        """
+        while time.time() < deadline:
+            for frame in _captcha_frames():
+                if time.time() >= deadline:
+                    return None
+                try:
+                    if frame.evaluate(script, {
+                        "exclude": exclude or {},
+                        "kindFilter": kind_filter or "",
+                        "actionFilter": action_filter or "",
+                        "randomize": bool(randomize),
+                    }):
+                        loc = frame.locator('[data-nb-captcha-control="1"]').first
+                        if loc.is_visible(timeout=100):
+                            return loc
+                except Exception as exc:
+                    if _is_target_closed(exc):
+                        if _page_is_closed(page):
+                            raise
+                        continue
+            remaining_ms = int((deadline - time.time()) * 1000)
+            if remaining_ms > 0:
+                page.wait_for_timeout(min(80, remaining_ms))
+        return None
+
+    def _locator_text(locator) -> str:
+        try:
+            return str(locator.evaluate(
+                """(el) => [
+                    el.getAttribute('aria-label') || '',
+                    el.innerText || '',
+                    el.value || '',
+                    el.textContent || '',
+                ].join(' ')"""
+            ) or "")
+        except Exception:
+            return ""
+
+    def _locator_state(locator) -> dict:
+        return locator.evaluate(
+            """(el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return {
+                    visible: rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none',
+                    text: [
+                        el.getAttribute('aria-label') || '',
+                        el.innerText || '',
+                        el.value || '',
+                        el.textContent || '',
+                    ].join(' ').trim(),
+                    ariaDisabled: el.getAttribute('aria-disabled') || '',
+                    disabled: Boolean(el.disabled),
+                };
+            }"""
+        )
+
+    def _challenge_completed_visible() -> bool:
+        script = """
+        () => {
+            const visible = (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none';
+            };
+            const bodyText = document.body ? (document.body.innerText || '') : '';
+            const ariaText = Array.from(document.querySelectorAll('[aria-label]'))
+                .filter((el) => {
+                    return visible(el);
+                })
+                .map((el) => [
+                    el.getAttribute('aria-label') || '',
+                ].join(' '))
+                .join(' ');
+            const text = `${bodyText} ${ariaText}`;
+            return /Human Challenge completed|challenge completed/i.test(text);
+        }
+        """
+        for frame in _captcha_frames():
+            try:
+                if frame.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _retry_signal_visible() -> bool:
+        script = """
+        () => {
+            const visible = (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none';
+            };
+            const bodyText = document.body ? (document.body.innerText || '') : '';
+            const ariaText = Array.from(document.querySelectorAll('[aria-label]'))
+                .filter((el) => {
+                    return visible(el);
+                })
+                .map((el) => [
+                    el.getAttribute('aria-label') || '',
+                ].join(' '))
+                .join(' ');
+            const text = `${bodyText} ${ariaText}`;
+            return /please try again|try again|retry/i.test(text);
+        }
+        """
+        for frame in _captcha_frames():
+            try:
+                if frame.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _control_kind(locator) -> str:
+        try:
+            return str(locator.get_attribute("data-nb-captcha-kind", timeout=100) or "")
+        except Exception:
+            return ""
+
+    def _control_action(locator) -> str:
+        try:
+            return str(locator.get_attribute("data-nb-captcha-action", timeout=100) or "")
+        except Exception:
+            return ""
+
+    def _summarize_control_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()[:80]
+
+    def _mark_clicked_control(locator, kind: str, text: str) -> dict:
+        click_id = f"{time.time_ns()}-{random.randint(1000, 9999)}"
+        locator.evaluate(
+            """(el, clickId) => el.setAttribute('data-nb-captcha-click-id', clickId)""",
+            click_id,
+        )
+        return {"clickId": click_id, "kind": kind, "text": text}
+
+    def _quick_click_locator(locator, timeout=300):
+        box = locator.bounding_box(timeout=timeout)
+        if not box:
+            locator.dispatch_event("click", timeout=timeout)
+            return
+        x = box["x"] + box["width"] / 2 + random.randint(-2, 2)
+        y = box["y"] + box["height"] / 2 + random.randint(-2, 2)
+        page.mouse.click(x, y)
+
+    def _captcha_hold_ms(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    captcha_min_hold_ms = max(3000, _captcha_hold_ms("OUTLOOK_REGISTER_CAPTCHA_MIN_HOLD_MS", 4500))
+    captcha_max_hold_ms = max(
+        captcha_min_hold_ms + 1000,
+        _captcha_hold_ms("OUTLOOK_REGISTER_CAPTCHA_MAX_HOLD_MS", 12000),
+    )
+
+    def _hold_until_component_changes(locator, timeout=300, min_hold_ms=None, max_hold_ms=None):
+        if min_hold_ms is None:
+            min_hold_ms = captcha_min_hold_ms
+        if max_hold_ms is None:
+            max_hold_ms = captcha_max_hold_ms
+        box = locator.bounding_box(timeout=timeout)
+        if not box:
+            raise TimeoutError("captcha action has no bounding box")
+        initial = _locator_state(locator)
+        x = box["x"] + box["width"] / 2 + random.randint(-2, 2)
+        y = box["y"] + box["height"] / 2 + random.randint(-2, 2)
+        try:
+            locator.scroll_into_view_if_needed(timeout=500)
+        except Exception:
+            pass
+        page.mouse.move(x, y, steps=random.randint(3, 7))
+        page.mouse.down()
+        reason = "max timeout"
+        started_at = time.time()
+        try:
+            while (time.time() - started_at) * 1000 < max_hold_ms:
+                page.wait_for_timeout(120)
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                if elapsed_ms < min_hold_ms:
+                    continue
+                if _challenge_completed_visible():
+                    reason = "challenge completed"
+                    break
+                try:
+                    current = _locator_state(locator)
+                except Exception as exc:
+                    if (
+                        "Frame was detached" in str(exc)
+                        or "Execution context was destroyed" in str(exc)
+                        or _is_target_closed(exc)
+                    ):
+                        reason = "component detached"
+                        break
+                    raise
+                if not current.get("visible", False):
+                    reason = "component hidden"
+                    break
+                if current.get("disabled") or current.get("ariaDisabled") == "true":
+                    reason = "component disabled"
+                    break
+                current_text = str(current.get("text") or "")
+                if re.search(r"press again|try again|next|continue|completed|please wait", current_text, re.I):
+                    reason = "component advanced"
+                    break
+        finally:
+            try:
+                page.mouse.up()
+            except Exception:
+                pass
+        return reason
+
+    def _wait_after_captcha_click(
+        previous_url: str,
+        clicked_control: Optional[dict] = None,
+        timeout=15000,
+        next_kind: Optional[str] = "action",
+        next_action: Optional[str] = None,
+        wait_for_control=True,
+    ) -> str:
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            try:
+                current_url = page.url
+            except Exception as exc:
+                if _is_target_closed(exc):
+                    return "closed"
+                raise
+
+            if _is_mailbox_url(current_url):
+                return "mailbox"
+            if current_url != previous_url:
+                return "url_changed"
+
+            if _retry_signal_visible():
+                return "retry_signal"
+
+            if wait_for_control:
+                control = _find_control_in_any_frame(
+                    timeout=250,
+                    exclude=clicked_control,
+                    kind_filter=next_kind,
+                    action_filter=next_action,
+                )
+                if control:
+                    return "control"
+
+            remaining_ms = int((deadline - time.time()) * 1000)
+            if remaining_ms > 0:
+                page.wait_for_timeout(min(250, remaining_ms))
+        return "timeout"
+
+    max_retry_signals = max(1, int(max_retries))
+    max_interaction_steps = max(20, max_retry_signals * 6)
+    retry_signals = 0
+    step = 0
+    next_search_kind: Optional[str] = None
+    next_search_action: Optional[str] = None
 
     try:
-        for attempt in range(max_retries + 1):
-            page.wait_for_timeout(random.randint(200, 500))
-
-            # Step 1: Click accessible challenge button
-            logger.info("[captcha] Looking for accessible challenge (attempt %d/%d)...", attempt + 1, max_retries)
-            acc_btn = _find_in_any_frame(accessible_sel, timeout=5000)
-            if acc_btn:
-                try:
-                    _click_with_bezier(page, acc_btn, hold_ms=0)
-                    logger.info("[captcha] Clicked accessible challenge")
-                except Exception as e:
-                    if _is_target_closed(e):
-                        raise
-                    logger.warning("[captcha] Click accessible failed: %s", e)
-            else:
-                logger.warning("[captcha] No accessible challenge button found")
-
-            # Step 2: Click the action button
-            page.wait_for_timeout(random.randint(300, 600))
-            logger.info("[captcha] Looking for action button...")
-            press_btn = _find_in_any_frame(press_sel, timeout=5000)
-            if not press_btn:
-                logger.warning("[captcha] No action button found, retrying...")
-                continue
-
-            try:
-                _click_with_bezier(page, press_btn, hold_ms=0)
-                logger.info("[captcha] Action button clicked")
-            except Exception as e:
-                if _is_target_closed(e):
-                    raise
-                logger.error("[captcha] Action button click failed: %s", e)
+        while retry_signals < max_retry_signals and step < max_interaction_steps:
+            step += 1
+            logger.info(
+                "[captcha] Waiting for clickable challenge control (step %d, retry %d/%d)...",
+                step,
+                retry_signals,
+                max_retry_signals,
+            )
+            control = _find_control_in_any_frame(
+                timeout=15000,
+                kind_filter=next_search_kind,
+                action_filter=next_search_action,
+                randomize=next_search_kind is None,
+            )
+            if not control:
+                logger.error("[captcha] Timed out waiting for clickable challenge control")
                 return False
 
-            # Step 3: Wait for draw canvas to detach
             try:
-                logger.info("[captcha] Waiting for challenge to resolve (.draw detach)...")
-                page.locator('.draw').wait_for(state="detached", timeout=15000)
-                logger.info("[captcha] Challenge resolved")
-            except Exception as e:
-                if _is_target_closed(e):
-                    raise
-                try:
-                    if page.get_by_text('取消').count() > 0:
-                        logger.info("[captcha] passed (cancel button)")
-                        return True
-                except Exception:
-                    pass
-                logger.info("[captcha] .draw detach timeout, continuing to next attempt")
-                continue
+                previous_url = page.url
+                delay_ms = random.randint(500, 2000)
+                logger.info("[captcha] Clickable control found; waiting %dms before click", delay_ms)
+                page.wait_for_timeout(delay_ms)
+                fresh_control = _find_control_in_any_frame(
+                    timeout=500,
+                    kind_filter=next_search_kind,
+                    action_filter=next_search_action,
+                    randomize=next_search_kind is None,
+                )
+                if fresh_control:
+                    control = fresh_control
+                kind = _control_kind(control)
+                action = _control_action(control)
+                action_text = _locator_text(control)
+                logger.info(
+                    "[captcha] Control ready (%s/%s: %s)",
+                    kind or "unknown",
+                    action or "-",
+                    _summarize_control_text(action_text) or "<no text>",
+                )
+                clicked_control = _mark_clicked_control(control, kind, action_text)
+                expected_action: Optional[str] = None
 
-            # Step 4: Check result
-            try:
-                logger.info("[captcha] Checking result, waiting for loading indicator...")
-                page.locator('[role="status"][aria-label="正在加载..."]').wait_for(timeout=5000)
-                page.locator('[role="status"][aria-label="正在加载..."]').wait_for(state="detached", timeout=15000)
+                if re.search(r"completed|please wait", action_text, re.I):
+                    logger.info("[captcha] Challenge already completed; waiting for next state")
+                elif kind == "accessible" or re.search(r"accessible challenge", action_text, re.I):
+                    _quick_click_locator(control, timeout=300)
+                    logger.info("[captcha] Accessible challenge clicked")
+                    expected_action = "again"
+                elif action == "again" or re.search(r"press again|try again", action_text, re.I):
+                    _quick_click_locator(control, timeout=300)
+                    logger.info("[captcha] Press again clicked")
+                    expected_action = None
+                elif action == "hold" or re.search(r"press", action_text, re.I):
+                    logger.info(
+                        "[captcha] Press-and-hold action button until component changes (min %dms, max %dms)",
+                        captcha_min_hold_ms,
+                        captcha_max_hold_ms,
+                    )
+                    reason = _hold_until_component_changes(control, timeout=300)
+                    logger.info("[captcha] Action button held until %s", reason)
+                    expected_action = None
+                else:
+                    _quick_click_locator(control, timeout=300)
+                    logger.info("[captcha] Action button clicked")
 
-                if page.get_by_text('一些异常活动').count() > 0 or page.get_by_text('此站点正在维护').count() > 0:
-                    logger.error("[captcha] Rate limited")
-                    return False
-
-                # Check if challenge button reappeared (need retry)
-                logger.info("[captcha] Checking if challenge reappeared...")
-                retry_btn = _find_in_any_frame(accessible_sel, timeout=3000)
-                if retry_btn:
-                    logger.info("[captcha] Need retry, attempt %d/%d", attempt + 1, max_retries)
+                next_state = _wait_after_captcha_click(
+                    previous_url,
+                    clicked_control=clicked_control,
+                    timeout=15000,
+                    next_kind="action",
+                    next_action=expected_action,
+                    wait_for_control=True,
+                )
+                logger.info("[captcha] Next state after click: %s", next_state)
+                if next_state in {"mailbox", "url_changed", "success_signal"}:
+                    return True
+                if next_state == "retry_signal":
+                    retry_signals += 1
+                    if retry_signals >= max_retry_signals:
+                        logger.error(
+                            "[captcha] Challenge retry signals exhausted (%d/%d)",
+                            retry_signals,
+                            max_retry_signals,
+                        )
+                        return False
+                    logger.warning(
+                        "[captcha] Challenge returned retry signal (retry %d/%d); retrying",
+                        retry_signals,
+                        max_retry_signals,
+                    )
+                    next_search_kind = None
+                    next_search_action = None
                     continue
-
-                logger.info("[captcha] passed on attempt %d", attempt + 1)
-                return True
-
+                if next_state == "control":
+                    if action in {"again", "hold"}:
+                        retry_signals += 1
+                        if retry_signals >= max_retry_signals:
+                            logger.error(
+                                "[captcha] Challenge retry controls exhausted (%d/%d)",
+                                retry_signals,
+                                max_retry_signals,
+                            )
+                            return False
+                        logger.warning(
+                            "[captcha] Challenge presented another control after %s (retry %d/%d); continuing",
+                            action,
+                            retry_signals,
+                            max_retry_signals,
+                        )
+                        next_search_kind = None
+                        next_search_action = None
+                    else:
+                        next_search_kind = "action"
+                        next_search_action = expected_action
+                    continue
+                logger.error("[captcha] Timed out waiting for next CAPTCHA state after action")
+                return False
             except Exception as e:
+                if "Frame was detached" in str(e) or "Execution context was destroyed" in str(e):
+                    logger.info("[captcha] Challenge frame changed during action, retrying...")
+                    continue
                 if _is_target_closed(e):
-                    raise
-                try:
-                    if page.get_by_text('取消').count() > 0:
-                        logger.info("[captcha] passed (cancel button)")
-                        return True
-                except Exception:
-                    pass
-                # Check for "请再试一次" in any frame
-                logger.info("[captcha] Checking for retry text in frames...")
-                for frame in page.frames:
-                    try:
-                        if frame.get_by_text("请再试一次").count() > 0:
-                            logger.info("[captcha] Retry requested")
-                            break
-                    except Exception:
-                        pass
-                logger.info("[captcha] End of attempt %d, continuing...", attempt + 1)
-                continue
+                    if _page_is_closed(page):
+                        raise
+                    logger.warning("[captcha] Action button frame closed, retrying...")
+                    continue
+                logger.error("[captcha] Action button click failed: %s", e)
+                return False
     except Exception as e:
         if _is_target_closed(e):
-            logger.error("[captcha] Browser page/context closed unexpectedly during CAPTCHA")
+            if _page_is_closed(page):
+                logger.error("[captcha] Browser page/context closed unexpectedly during CAPTCHA")
+            else:
+                logger.error("[captcha] CAPTCHA target closed unexpectedly during CAPTCHA")
             return False
         raise
 
-    logger.error("[captcha] all attempts exhausted")
+    if retry_signals >= max_retry_signals:
+        logger.error("[captcha] retry signals exhausted")
+    else:
+        logger.error("[captcha] interaction steps exhausted before CAPTCHA reached a final state")
     return False
 
 
@@ -792,7 +1334,7 @@ def _handle_captcha(page, max_retries=3) -> bool:
 def outlook_register(
     proxy: str = "",
     email_suffix: str = "@outlook.com",
-    max_captcha_retries: int = 3,
+    max_captcha_retries: int = 10,
     should_cancel_fn: Optional[Callable[[], bool]] = None,
     debug: bool = False,
 ) -> dict:
@@ -844,7 +1386,7 @@ def outlook_register(
         with Camoufox(
             headless=False if debug else headless, humanize=True, persistent_context=True,
             user_data_dir=tmp_profile, screen=Screen(max_width=1920, max_height=1080),
-            proxy=cf_proxy, geoip=True, locale="zh-CN",
+            proxy=cf_proxy, geoip=True, locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
@@ -853,11 +1395,19 @@ def outlook_register(
             try:
                 page.goto("https://outlook.live.com/mail/0/?prompt=create_account",
                           timeout=60000, wait_until="domcontentloaded")
-                page.get_by_text('同意并继续').wait_for(timeout=30000)
                 start_time = time.time()
-                page.wait_for_timeout(int(0.1 * wait_ms))
-                page.get_by_text('同意并继续').click(timeout=30000)
-                logger.info("[outlook] Consent accepted")
+                try:
+                    consent = _first_visible_locator(page, [
+                        'button:has-text("Agree and continue")',
+                        'button:has-text("Accept and continue")',
+                        'button:has-text("Agree")',
+                        'text="Agree and continue"',
+                    ], timeout=5000)
+                    page.wait_for_timeout(int(0.1 * wait_ms))
+                    consent.click(timeout=30000)
+                    logger.info("[outlook] Consent accepted")
+                except Exception:
+                    logger.info("[outlook] Consent screen not shown, continuing")
             except Exception as e:
                 page.screenshot(path=os.path.join(ss_dir, "outlook_no_consent.png"))
                 result["error"] = f"IP quality issue, cannot enter signup: {e}"
@@ -874,9 +1424,6 @@ def outlook_register(
                     page.locator('[role="option"]:text-is("@hotmail.com")').click()
 
                 email_input_selectors = [
-                    '[aria-label="新建电子邮件"]',
-                    'input[aria-label*="新建"]',
-                    'input[aria-label*="电子邮件"]',
                     'input[aria-label*="New email"]',
                     'input[name="MemberName"]',
                     'input[type="email"]',
@@ -891,7 +1438,7 @@ def outlook_register(
                     logger.info("[outlook] Trying email (%d/%d): %s", attempt, max_email_attempts, full_email)
 
                     email_input = _first_visible_locator(page, email_input_selectors, timeout=15000)
-                    _type_into(email_input, email_local)
+                    _type_into(email_input, email_local, delay=int(0.002 * wait_ms))
                     try:
                         actual_local = email_input.input_value(timeout=2000).strip().lower()
                         if actual_local != email_local.lower():
@@ -905,6 +1452,12 @@ def outlook_register(
                         pass
 
                     _click_primary(page, timeout=5000)
+                    page.wait_for_timeout(1000)
+                    if not _password_input_visible(page) and not _email_unavailable_visible(page):
+                        try:
+                            email_input.press("Enter", timeout=2000)
+                        except Exception:
+                            pass
                     outcome = _wait_for_email_outcome(page, email_local, email_suffix, timeout=30000)
                     if outcome == "password":
                         break
@@ -952,7 +1505,6 @@ def outlook_register(
                     'input[type="password"]',
                     '[name="Password"]',
                     '[name="passwd"]',
-                    'input[aria-label*="密码"]',
                     'input[aria-label*="Password"]',
                     'input[autocomplete="new-password"]',
                 ], timeout=30000)
@@ -973,9 +1525,7 @@ def outlook_register(
                 year_input = _first_visible_locator(page, [
                     '[name="BirthYear"]',
                     '#BirthYear',
-                    'input[aria-label="年份"]',
                     'input[aria-label*="Year"]',
-                    'input[placeholder*="年"]',
                     'input[inputmode="numeric"]',
                     'input[type="number"]',
                 ], timeout=10000)
@@ -986,28 +1536,19 @@ def outlook_register(
                     "January", "February", "March", "April", "May", "June",
                     "July", "August", "September", "October", "November", "December",
                 ]
-                try:
-                    _select_birth_value(
-                        page,
-                        "BirthMonth",
-                        month,
-                        [f"{month}月", month_names[int(month) - 1], str(int(month))],
-                    )
-                    page.wait_for_timeout(int(0.04 * wait_ms))
-                    _select_birth_value(
-                        page,
-                        "BirthDay",
-                        day,
-                        [f"{day}日", str(int(day))],
-                    )
-                except Exception:
-                    page.locator('[name="BirthMonth"]').click()
-                    page.wait_for_timeout(int(0.02 * wait_ms))
-                    page.locator(f'[role="option"]:text-is("{month}月")').click()
-                    page.wait_for_timeout(int(0.04 * wait_ms))
-                    page.locator('[name="BirthDay"]').click()
-                    page.wait_for_timeout(int(0.03 * wait_ms))
-                    page.locator(f'[role="option"]:text-is("{day}日")').click()
+                _select_birth_value(
+                    page,
+                    "BirthMonth",
+                    month,
+                    [month_names[int(month) - 1], str(int(month))],
+                )
+                page.wait_for_timeout(int(0.04 * wait_ms))
+                _select_birth_value(
+                    page,
+                    "BirthDay",
+                    day,
+                    [str(int(day))],
+                )
                 _click_primary(page, timeout=5000)
                 page.wait_for_timeout(int(0.03 * wait_ms))
 
@@ -1015,10 +1556,8 @@ def outlook_register(
                     '#lastNameInput',
                     '[name="LastName"]',
                     '[name="lastName"]',
-                    'input[aria-label="姓"]',
                     'input[aria-label*="Last"]',
                     'input[aria-label*="Surname"]',
-                    'input[placeholder="姓"]',
                 ], timeout=15000)
                 _type_into(last_name_input, last_name, delay=int(0.002 * wait_ms))
                 page.wait_for_timeout(int(0.02 * wait_ms))
@@ -1027,10 +1566,8 @@ def outlook_register(
                     '#firstNameInput',
                     '[name="FirstName"]',
                     '[name="firstName"]',
-                    'input[aria-label="名"]',
                     'input[aria-label*="First"]',
                     'input[aria-label*="Given"]',
-                    'input[placeholder="名"]',
                 ], timeout=10000)
                 _type_into(first_name_input, first_name)
 
@@ -1054,8 +1591,12 @@ def outlook_register(
                 return result
 
             # [5] Check for rate limit before captcha
-            if page.get_by_text('一些异常活动').count() > 0 or \
-               page.get_by_text('此站点正在维护').count() > 0:
+            if _visible_text_present(page, [
+                'unusual activity',
+                'temporarily restricted',
+                'site is under maintenance',
+                'site is being maintained',
+            ]):
                 page.screenshot(path=os.path.join(ss_dir, "outlook_rate_limit.png"))
                 result["error"] = "Rate limited (IP flagged)"
                 logger.error("[outlook] %s", result["error"])
@@ -1077,12 +1618,12 @@ def outlook_register(
                 for fr in page.frames if fr.url
             )
             has_captcha_elements = page.locator(
-                '[aria-label="可访问性挑战"], [aria-label="Accessible challenge"]'
+                '[aria-label="Accessible challenge"]'
             ).count() > 0
 
             if not has_captcha_frame and not has_captcha_elements:
                 # No CAPTCHA elements found - check if we're already on the success page
-                if 'outlook.live.com/mail' in current_url or 'outlook.office.com' in current_url:
+                if _is_mailbox_url(current_url):
                     logger.info("[outlook] No CAPTCHA detected, already on mailbox page - registration successful!")
                     result["success"] = True
                     result["email"] = full_email
@@ -1091,14 +1632,14 @@ def outlook_register(
                 # Wait briefly and re-check (page might be transitioning)
                 page.wait_for_timeout(1000)
                 current_url = page.url
-                if 'outlook.live.com/mail' in current_url or 'outlook.office.com' in current_url:
+                if _is_mailbox_url(current_url):
                     logger.info("[outlook] No CAPTCHA detected after wait - registration successful!")
                     result["success"] = True
                     result["email"] = full_email
                     logger.info("[outlook] ✅ Registration successful (no CAPTCHA): %s", full_email)
                     return result
 
-            # [6] Handle CAPTCHA
+            # [6] Handle CAPTCHA until success or max attempts are exhausted.
             logger.info("[outlook] Handling CAPTCHA...")
             captcha_ok = _handle_captcha(page, max_retries=max_captcha_retries)
             if not captcha_ok:
@@ -1111,7 +1652,17 @@ def outlook_register(
                 _debug_pause(result["error"])
                 return result
 
-            # [7] Success!
+            # [7] Confirm registration reached a real mailbox page before saving.
+            if not _wait_for_mailbox_success(page, timeout=60000):
+                try:
+                    page.screenshot(path=os.path.join(ss_dir, "outlook_registration_unconfirmed.png"))
+                except Exception:
+                    pass
+                result["error"] = "Registration not confirmed after CAPTCHA"
+                logger.error("[outlook] %s", result["error"])
+                _debug_pause(result["error"])
+                return result
+
             result["success"] = True
             result["email"] = full_email
             logger.info("[outlook] ✅ Registration successful: %s", full_email)
@@ -1141,7 +1692,7 @@ def main():
     parser = argparse.ArgumentParser(description="Camoufox Outlook Registration")
     parser.add_argument("--proxy", default=os.environ.get("OUTLOOK_REGISTER_PROXY", ""), help="Proxy URL")
     parser.add_argument("--suffix", default=os.environ.get("OUTLOOK_REGISTER_EMAIL_SUFFIX", "@outlook.com"), help="Email suffix")
-    parser.add_argument("--max-retries", type=int, default=int(os.environ.get("OUTLOOK_REGISTER_MAX_CAPTCHA_RETRIES", "3")), help="Max CAPTCHA retries")
+    parser.add_argument("--max-retries", type=int, default=int(os.environ.get("OUTLOOK_REGISTER_MAX_CAPTCHA_RETRIES", "10")), help="Max CAPTCHA retries")
     parser.add_argument("--results-dir", default=os.environ.get("OUTLOOK_REGISTER_RESULTS_DIR", ""), help="Directory to output results")
     parser.add_argument("--debug", action="store_true", default=False, help="Keep browser open on failure for debugging")
     args = parser.parse_args()

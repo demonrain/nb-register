@@ -130,8 +130,12 @@ func (w *MailWatcher) PollForEmail(ctx context.Context, email string) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.fetchMailboxMessages(ctx, mailbox, w.messageLimit, 0)
-	return err
+	messages, err := w.fetchMailboxMessages(ctx, mailbox, w.messageLimit, 0)
+	if err != nil {
+		return err
+	}
+	w.processMessages(ctx, mailbox.GetEmailAddress(), messages)
+	return nil
 }
 
 func (w *MailWatcher) FetchMailboxInbox(ctx context.Context, mailbox *pb.EmailMailbox, limit int32) ([]*pb.EmailInboxMessage, error) {
@@ -152,9 +156,11 @@ func (w *MailWatcher) FetchMailboxInbox(ctx context.Context, mailbox *pb.EmailMa
 	if err != nil {
 		return nil, err
 	}
-	if _, err := w.store.RecordInboxMessages(ctx, mailbox.GetEmailAddress(), messages); err != nil {
+	unseen, err := w.store.RecordInboxMessages(ctx, mailbox.GetEmailAddress(), messages)
+	if err != nil {
 		return nil, err
 	}
+	w.processMessages(ctx, mailbox.GetEmailAddress(), unseen)
 	return w.store.ListInboxMessages(ctx, mailbox.GetEmailAddress(), int32(messageLimit))
 }
 
@@ -192,7 +198,6 @@ func (w *MailWatcher) fetchMailboxMessages(ctx context.Context, mailbox *pb.Emai
 			return nil, err
 		}
 	}
-	w.processMessages(ctx, mailbox.GetEmailAddress(), messages)
 	return messages, nil
 }
 
@@ -291,6 +296,8 @@ func (w *MailWatcher) fetchOnce(ctx context.Context, accessToken string, limit i
 }
 
 func (w *MailWatcher) processMessages(ctx context.Context, sourceEmail string, messages []graphMessage) {
+	cachedMessages := 0
+	cachedRecipients := 0
 	for _, msg := range messages {
 		msgKey := sourceEmail + ":" + messageKey(msg)
 		w.mu.Lock()
@@ -314,7 +321,10 @@ func (w *MailWatcher) processMessages(ctx context.Context, sourceEmail string, m
 		if receivedAt == 0 {
 			receivedAt = float64(time.Now().Unix())
 		}
-		w.cacheOTP(msg.Subject, otp, recipients, receivedAt)
+		if cached := w.cacheOTP(msg.Subject, otp, recipients, receivedAt); cached > 0 {
+			cachedMessages++
+			cachedRecipients += cached
+		}
 		if w.store != nil {
 			for _, recipient := range recipients {
 				if err := w.store.UpsertLatestOTP(ctx, recipient, otp, msg.Subject, sourceEmail, int64(receivedAt)); err != nil {
@@ -323,9 +333,16 @@ func (w *MailWatcher) processMessages(ctx context.Context, sourceEmail string, m
 			}
 		}
 	}
+	if cachedMessages > 0 {
+		logInfo("cached OTP from %d message(s) for %d recipient(s)", cachedMessages, cachedRecipients)
+	}
 }
 
-func (w *MailWatcher) cacheOTP(subject string, otp string, recipients []string, receivedAt float64) {
+func (w *MailWatcher) cacheOTP(subject string, otp string, recipients []string, receivedAt float64) int {
+	recipients = uniqueStrings(recipients)
+	if len(recipients) == 0 {
+		return 0
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, recipient := range recipients {
@@ -339,7 +356,7 @@ func (w *MailWatcher) cacheOTP(subject string, otp string, recipients []string, 
 			}
 		}
 	}
-	logInfo("cached OTP for %d recipient(s)", len(recipients))
+	return len(recipients)
 }
 
 func inboxMessages(mailboxEmail string, messages []graphMessage) []*pb.EmailInboxMessage {

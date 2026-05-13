@@ -19,6 +19,24 @@ func boolPtr(value bool) *bool {
 	return &value
 }
 
+func rejectUserAlreadyExistsAccount(account *pb.Account) error {
+	if account != nil && isUserAlreadyExistsStatus(account.GetStatus()) {
+		return fmt.Errorf("account user already exists; delete only")
+	}
+	return nil
+}
+
+func accountRef(account *pb.Account) AccountRef {
+	if account == nil {
+		return AccountRef{}
+	}
+	return AccountRef{
+		AccountID:         account.GetAccountId(),
+		PlusTrialKnown:    account.PlusTrialEligible != nil,
+		PlusTrialEligible: account.GetPlusTrialEligible(),
+	}
+}
+
 func isFreeTrialIneligibleError(err error) bool {
 	if err == nil {
 		return false
@@ -30,6 +48,9 @@ func isFreeTrialIneligibleError(err error) bool {
 func accountEligibleForActivation(account *pb.Account) error {
 	if account == nil {
 		return fmt.Errorf("account is required")
+	}
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
+		return err
 	}
 	tier := normalizeTier(account.GetTier())
 	if tier != "free" {
@@ -59,6 +80,9 @@ func (s *orchestratorServer) EnsureAccountActivity(ctx context.Context, input En
 	}
 
 	if account, err := s.getAccount(ctx, spec.AccountID); err == nil {
+		if err := rejectUserAlreadyExistsAccount(account); err != nil {
+			return AccountRef{}, err
+		}
 		if strings.TrimSpace(account.GetEmail()) == "" {
 			email, err := s.acquireEmail(ctx, nil)
 			if err != nil {
@@ -72,7 +96,7 @@ func (s *orchestratorServer) EnsureAccountActivity(ctx context.Context, input En
 				return AccountRef{}, err
 			}
 		}
-		return AccountRef{AccountID: account.GetAccountId()}, nil
+		return accountRef(account), nil
 	}
 
 	email := spec.Email
@@ -92,14 +116,17 @@ func (s *orchestratorServer) EnsureAccountActivity(ctx context.Context, input En
 	}})
 	if err != nil {
 		if account, getErr := s.getAccount(ctx, spec.AccountID); getErr == nil {
-			return AccountRef{AccountID: account.GetAccountId()}, nil
+			if err := rejectUserAlreadyExistsAccount(account); err != nil {
+				return AccountRef{}, err
+			}
+			return accountRef(account), nil
 		}
 		return AccountRef{}, err
 	}
 	if resp.GetAccount() == nil || resp.GetAccount().GetAccountId() == "" {
 		return AccountRef{}, fmt.Errorf("account-db returned empty account")
 	}
-	return AccountRef{AccountID: resp.GetAccount().GetAccountId()}, nil
+	return accountRef(resp.GetAccount()), nil
 }
 
 func (s *orchestratorServer) acquireEmail(ctx context.Context, excludes []string) (string, error) {
@@ -125,7 +152,10 @@ func (s *orchestratorServer) ResolveAccountFromJobActivity(ctx context.Context, 
 		if err != nil {
 			return AccountRef{}, err
 		}
-		return AccountRef{AccountID: account.GetAccountId()}, nil
+		if err := rejectUserAlreadyExistsAccount(account); err != nil {
+			return AccountRef{}, err
+		}
+		return accountRef(account), nil
 	}
 	job, err := s.getJob(ctx, input.SourceJobID)
 	if err != nil {
@@ -135,12 +165,18 @@ func (s *orchestratorServer) ResolveAccountFromJobActivity(ctx context.Context, 
 	if err != nil {
 		return AccountRef{}, err
 	}
-	return AccountRef{AccountID: account.GetAccountId()}, nil
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
+		return AccountRef{}, err
+	}
+	return accountRef(account), nil
 }
 
 func (s *orchestratorServer) RegisterAccountAtomicActivity(ctx context.Context, input RegisterActivityInput) (RegisterActivityOutput, error) {
 	account, err := s.getAccount(ctx, input.AccountID)
 	if err != nil {
+		return RegisterActivityOutput{}, err
+	}
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
 		return RegisterActivityOutput{}, err
 	}
 
@@ -156,14 +192,14 @@ func (s *orchestratorServer) RegisterAccountAtomicActivity(ctx context.Context, 
 			if data == nil {
 				data = map[string]any{}
 			}
-			data["terminal_reason"] = "openai_account_already_registered"
+			data["terminal_reason"] = "openai_user_already_exists"
 			updateErr := s.updateAccount(ctx, &pb.Account{
 				AccountId:    input.AccountID,
-				Status:       accountStatusRegistered,
+				Status:       accountStatusUserAlreadyExists,
 				ErrorMessage: err.Error(),
 			})
 			if updateErr != nil {
-				return RegisterActivityOutput{Data: data}, fmt.Errorf("%w; additionally failed to mark account registered: %v", err, updateErr)
+				return RegisterActivityOutput{Data: data}, fmt.Errorf("%w; additionally failed to mark account user already exists: %v", err, updateErr)
 			}
 		}
 		return RegisterActivityOutput{Data: data}, err
@@ -216,11 +252,11 @@ func (s *orchestratorServer) registerWithMailboxRotation(ctx context.Context, jo
 			return nil, data, err
 		}
 
-		attemptData["terminal_reason"] = "openai_account_already_registered"
+		attemptData["terminal_reason"] = "openai_user_already_exists"
 		if markErr := s.markOpenAIAccountRegistered(ctx, current, err); markErr != nil {
-			return nil, data, fmt.Errorf("%w; additionally failed to mark account registered: %v", err, markErr)
+			return nil, data, fmt.Errorf("%w; additionally failed to mark account user already exists: %v", err, markErr)
 		}
-		data["terminal_reason"] = "openai_account_already_registered"
+		data["terminal_reason"] = "openai_user_already_exists"
 		return nil, data, err
 	}
 
@@ -244,7 +280,7 @@ func (s *orchestratorServer) markOpenAIAccountRegistered(ctx context.Context, ac
 	}
 	return s.updateAccount(ctx, &pb.Account{
 		AccountId:    account.GetAccountId(),
-		Status:       accountStatusEmailAlreadyExists,
+		Status:       accountStatusUserAlreadyExists,
 		ErrorMessage: cause.Error(),
 	})
 }
@@ -308,7 +344,7 @@ func (s *orchestratorServer) GoPayPaymentAtomicActivity(ctx context.Context, inp
 	var data map[string]any
 	_, err = s.runAtomicStep(ctx, input.JobID, stepGoPayPayment, false, true, func() (any, error) {
 		var stepErr error
-		result, data, stepErr = s.pay(ctx, input.JobID, account, input.SessionToken, input.AccessToken)
+		result, data, stepErr = s.pay(ctx, input.JobID, account, input.SessionToken, input.AccessToken, input.UseCycleToken)
 		return data, stepErr
 	})
 	if err != nil {
@@ -335,6 +371,9 @@ func (s *orchestratorServer) GoPayPaymentAtomicActivity(ctx context.Context, inp
 func (s *orchestratorServer) ProbePlusTrialAtomicActivity(ctx context.Context, input ProbePlusTrialActivityInput) (ProbePlusTrialActivityOutput, error) {
 	account, err := s.getAccount(ctx, input.AccountID)
 	if err != nil {
+		return ProbePlusTrialActivityOutput{}, err
+	}
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
 		return ProbePlusTrialActivityOutput{}, err
 	}
 
@@ -426,6 +465,9 @@ func (s *orchestratorServer) ProbeTierAtomicActivity(ctx context.Context, input 
 	if err != nil {
 		return ProbeTierActivityOutput{}, err
 	}
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
+		return ProbeTierActivityOutput{}, err
+	}
 
 	var output ProbeTierActivityOutput
 	_, err = s.runAtomicStep(ctx, input.JobID, stepProbeTier, false, true, func() (any, error) {
@@ -471,8 +513,8 @@ func (s *orchestratorServer) ProbeTierAtomicActivity(ctx context.Context, input 
 		}
 		if resp.GetChecked() {
 			update := &pb.Account{
-				AccountId:   input.AccountID,
-				Tier:        output.Tier,
+				AccountId:  input.AccountID,
+				Tier:       output.Tier,
 				PlusActive: boolPtr(resp.GetPlusActive()),
 			}
 			if resp.GetPlusActive() {
@@ -496,6 +538,9 @@ func (s *orchestratorServer) ProbeTierAtomicActivity(ctx context.Context, input 
 func (s *orchestratorServer) LoginSessionAtomicActivity(ctx context.Context, input LoginSessionActivityInput) (LoginSessionActivityOutput, error) {
 	account, err := s.getAccount(ctx, input.AccountID)
 	if err != nil {
+		return LoginSessionActivityOutput{}, err
+	}
+	if err := rejectUserAlreadyExistsAccount(account); err != nil {
 		return LoginSessionActivityOutput{}, err
 	}
 	if strings.TrimSpace(account.GetEmail()) == "" {

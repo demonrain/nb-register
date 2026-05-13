@@ -1,10 +1,13 @@
 package main
 
 import (
+	"fmt"
+	pb "orchestrator/pb"
 	"strconv"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -16,7 +19,9 @@ const (
 	ensureAccountActivityName     = "EnsureAccountActivity"
 	resolveAccountActivityName    = "ResolveAccountFromJobActivity"
 	registerAccountActivityName   = "RegisterAccountAtomicActivity"
+	ensureLogonActivityName       = "EnsureLogonActivity"
 	goPayPaymentActivityName      = "GoPayPaymentAtomicActivity"
+	cycleAndPayActivityName       = "CycleAndPayActivity"
 	probePlusTrialActivityName    = "ProbePlusTrialAtomicActivity"
 	probeTierActivityName         = "ProbeTierAtomicActivity"
 	loginSessionActivityName      = "LoginSessionAtomicActivity"
@@ -70,6 +75,7 @@ func RegisterAccountWorkflow(ctx workflow.Context, input RegisterAccountWorkflow
 		JobID:  input.JobID,
 		Result: register.Data,
 	}).Get(ctx, nil)
+	startRegisteredAccountProbeSideEffects(ctx, input.JobID, account.AccountID)
 
 	result.SessionToken = register.SessionToken
 	result.AccessToken = register.AccessToken
@@ -82,6 +88,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	result := ActivateAccountWorkflowResult{JobID: input.JobID}
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(15*time.Minute))
+	ensureLogonCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
 
 	var account AccountRef
 	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
@@ -101,12 +108,35 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 		return result, nil
 	}
 
-	var payment GoPayActivityOutput
-	if err := workflow.ExecuteActivity(atomicCtx, goPayPaymentActivityName, GoPayActivityInput{
+	var probe ProbePlusTrialActivityOutput
+	if err := workflow.ExecuteActivity(atomicCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
 		JobID:     input.JobID,
 		AccountID: account.AccountID,
+	}).Get(ctx, &probe); err != nil {
+		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, err, map[string]any{"probe_plus_trial": probe.Data}), nil
+	}
+	if !probe.Checked {
+		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, fmt.Errorf("plus trial eligibility is unknown"), map[string]any{"probe_plus_trial": probe.Data}), nil
+	}
+	if !probe.PlusTrialEligible && !probe.PlusActive {
+		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedFinal, false, false, fmt.Errorf("account is not plus trial eligible"), map[string]any{"probe_plus_trial": probe.Data}), nil
+	}
+
+	var ensureLogon pb.EnsureLogonResponse
+	if err := workflow.ExecuteActivity(ensureLogonCtx, ensureLogonActivityName, &pb.EnsureLogonRequest{
+		JobId:     input.JobID,
+		AccountId: account.AccountID,
+	}).Get(ctx, &ensureLogon); err != nil {
+		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepEnsureLogon, statusFailedRetryable, false, true, err, activationPaymentData(ensureLogonData(&ensureLogon), probe.Data)), nil
+	}
+
+	var payment GoPayActivityOutput
+	if err := workflow.ExecuteActivity(atomicCtx, goPayPaymentActivityName, GoPayActivityInput{
+		JobID:         input.JobID,
+		AccountID:     account.AccountID,
+		UseCycleToken: ensureLogon.GetCycleTokenReady(),
 	}).Get(ctx, &payment); err != nil {
-		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepGoPayPayment, statusFailedRetryable, false, true, err, payment.Data), nil
+		return failActivateWorkflow(ctx, retryCtx, result, input.JobID, stepGoPayPayment, statusFailedRetryable, false, true, err, activationPaymentData(ensureLogonData(&ensureLogon), map[string]any{"probe_plus_trial": probe.Data, "gopay_payment": payment.Data})), nil
 	}
 
 	if err := workflow.ExecuteActivity(retryCtx, persistActivatedActivityName, PersistActivatedInput{
@@ -121,7 +151,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 
 	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
 		JobID:  input.JobID,
-		Result: payment.Data,
+		Result: activationPaymentData(ensureLogonData(&ensureLogon), map[string]any{"probe_plus_trial": probe.Data, "gopay_payment": payment.Data}),
 	}).Get(ctx, nil)
 
 	result.Success = true
@@ -130,10 +160,11 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	return result, nil
 }
 
-func ProbePlusTrialWorkflow(ctx workflow.Context, input ProbePlusTrialWorkflowInput) (ProbePlusTrialWorkflowResult, error) {
-	result := ProbePlusTrialWorkflowResult{JobID: input.JobID}
+func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput) (ProbeAccountWorkflowResult, error) {
+	result := ProbeAccountWorkflowResult{JobID: input.JobID}
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
-	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
+	plusTrialCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
+	tierCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(2*time.Minute))
 
 	var account AccountRef
 	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
@@ -146,79 +177,69 @@ func ProbePlusTrialWorkflow(ctx workflow.Context, input ProbePlusTrialWorkflowIn
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobID:     input.JobID,
 		AccountID: account.AccountID,
-		Action:    actionProbePlusTrial,
+		Action:    actionProbeAccount,
 	}).Get(ctx, nil); err != nil {
 		result.ErrorMessage = err.Error()
 		return result, nil
 	}
 
-	var probe ProbePlusTrialActivityOutput
-	if err := workflow.ExecuteActivity(atomicCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
+	combined := map[string]any{
+		"account_id":               account.AccountID,
+		"plus_trial_already_known": account.PlusTrialKnown,
+	}
+	var plusTrial ProbePlusTrialActivityOutput
+	if !account.PlusTrialKnown {
+		if err := workflow.ExecuteActivity(plusTrialCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
+			JobID:     input.JobID,
+			AccountID: account.AccountID,
+		}).Get(ctx, &plusTrial); err != nil {
+			combined["probe_plus_trial"] = plusTrial.Data
+			return failProbeAccountWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, err, combined), nil
+		}
+		result.PlusTrialChecked = plusTrial.Checked
+		result.PlusTrialEligible = plusTrial.PlusTrialEligible
+		result.PlusActive = plusTrial.PlusActive
+		result.Amount = plusTrial.Amount
+		result.Currency = plusTrial.Currency
+		result.Source = plusTrial.Source
+		result.PlanType = plusTrial.PlanType
+		result.CheckoutURL = plusTrial.CheckoutURL
+		combined["probe_plus_trial"] = plusTrial.Data
+	} else {
+		result.PlusTrialChecked = true
+		result.PlusTrialEligible = account.PlusTrialEligible
+		combined["probe_plus_trial"] = map[string]any{
+			"skipped":             true,
+			"reason":              "plus_trial_already_known",
+			"plus_trial_eligible": account.PlusTrialEligible,
+		}
+	}
+
+	var tier ProbeTierActivityOutput
+	if err := workflow.ExecuteActivity(tierCtx, probeTierActivityName, ProbeTierActivityInput{
 		JobID:     input.JobID,
 		AccountID: account.AccountID,
-	}).Get(ctx, &probe); err != nil {
-		return failProbePlusTrialWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, err, probe.Data), nil
+	}).Get(ctx, &tier); err != nil {
+		combined["probe_tier"] = tier.Data
+		return failProbeAccountWorkflow(ctx, retryCtx, result, input.JobID, stepProbeTier, statusFailedRetryable, false, true, err, combined), nil
 	}
+	combined["probe_tier"] = tier.Data
 
 	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
 		JobID:  input.JobID,
-		Result: probe.Data,
+		Result: combined,
 	}).Get(ctx, nil)
 
-	result.Success = probe.Success
-	result.Checked = probe.Checked
-	result.PlusTrialEligible = probe.PlusTrialEligible
-	result.PlusActive = probe.PlusActive
-	result.Amount = probe.Amount
-	result.Currency = probe.Currency
-	result.Source = probe.Source
-	result.PlanType = probe.PlanType
-	result.CheckoutURL = probe.CheckoutURL
-	result.ErrorMessage = probe.ErrorMessage
-	return result, nil
-}
-
-func ProbeTierWorkflow(ctx workflow.Context, input ProbeTierWorkflowInput) (ProbeTierWorkflowResult, error) {
-	result := ProbeTierWorkflowResult{JobID: input.JobID}
-	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
-	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(2*time.Minute))
-
-	var account AccountRef
-	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
-		AccountID: input.AccountID,
-	}).Get(ctx, &account); err != nil {
-		result.ErrorMessage = err.Error()
-		return result, nil
+	result.Success = tier.Success && (account.PlusTrialKnown || plusTrial.Success)
+	result.TierChecked = tier.Checked
+	result.Tier = tier.Tier
+	if tier.PlusActive {
+		result.PlusActive = true
 	}
-
-	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
-		JobID:     input.JobID,
-		AccountID: account.AccountID,
-		Action:    actionProbeTier,
-	}).Get(ctx, nil); err != nil {
-		result.ErrorMessage = err.Error()
-		return result, nil
+	if tier.Source != "" {
+		result.Source = tier.Source
 	}
-
-	var probe ProbeTierActivityOutput
-	if err := workflow.ExecuteActivity(atomicCtx, probeTierActivityName, ProbeTierActivityInput{
-		JobID:     input.JobID,
-		AccountID: account.AccountID,
-	}).Get(ctx, &probe); err != nil {
-		return failProbeTierWorkflow(ctx, retryCtx, result, input.JobID, stepProbeTier, statusFailedRetryable, false, true, err, probe.Data), nil
-	}
-
-	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
-		JobID:  input.JobID,
-		Result: probe.Data,
-	}).Get(ctx, nil)
-
-	result.Success = probe.Success
-	result.Checked = probe.Checked
-	result.Tier = probe.Tier
-	result.PlusActive = probe.PlusActive
-	result.Source = probe.Source
-	result.ErrorMessage = probe.ErrorMessage
+	result.ErrorMessage = tier.ErrorMessage
 	return result, nil
 }
 
@@ -274,6 +295,7 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 	result := RegisterAndActivateWorkflowResult{JobID: input.JobID}
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(15*time.Minute))
+	ensureLogonCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
 
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobID:     input.JobID,
@@ -316,19 +338,46 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 		combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data}
 		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, err, combined), nil
 	}
+	if !probe.Checked {
+		combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data}
+		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedRetryable, false, true, fmt.Errorf("plus trial eligibility is unknown"), combined), nil
+	}
+	if !probe.PlusTrialEligible && !probe.PlusActive {
+		combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data}
+		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepProbePlusTrial, statusFailedFinal, false, false, fmt.Errorf("account is not plus trial eligible"), combined), nil
+	}
+
+	var ensureLogon pb.EnsureLogonResponse
+	if err := workflow.ExecuteActivity(ensureLogonCtx, ensureLogonActivityName, &pb.EnsureLogonRequest{
+		JobId:     input.JobID,
+		AccountId: account.AccountID,
+	}).Get(ctx, &ensureLogon); err != nil {
+		combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data}
+		if logonData := ensureLogonData(&ensureLogon); logonData != nil {
+			combined["ensure_logon"] = logonData
+		}
+		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepEnsureLogon, statusFailedRetryable, false, true, err, combined), nil
+	}
 
 	var payment GoPayActivityOutput
 	if err := workflow.ExecuteActivity(atomicCtx, goPayPaymentActivityName, GoPayActivityInput{
-		JobID:        input.JobID,
-		AccountID:    account.AccountID,
-		SessionToken: register.SessionToken,
-		AccessToken:  register.AccessToken,
+		JobID:         input.JobID,
+		AccountID:     account.AccountID,
+		SessionToken:  register.SessionToken,
+		AccessToken:   register.AccessToken,
+		UseCycleToken: ensureLogon.GetCycleTokenReady(),
 	}).Get(ctx, &payment); err != nil {
 		combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data, "gopay_payment": payment.Data}
+		if logonData := ensureLogonData(&ensureLogon); logonData != nil {
+			combined["ensure_logon"] = logonData
+		}
 		return failRegisterAndActivateWorkflow(ctx, retryCtx, result, input.JobID, stepGoPayPayment, statusFailedRetryable, false, true, err, combined), nil
 	}
 
 	combined := map[string]any{"register_account": register.Data, "probe_plus_trial": probe.Data, "gopay_payment": payment.Data}
+	if logonData := ensureLogonData(&ensureLogon); logonData != nil {
+		combined["ensure_logon"] = logonData
+	}
 	if err := workflow.ExecuteActivity(retryCtx, persistActivatedActivityName, PersistActivatedInput{
 		AccountID:         account.AccountID,
 		SessionToken:      register.SessionToken,
@@ -345,6 +394,7 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 		JobID:  input.JobID,
 		Result: combined,
 	}).Get(ctx, nil)
+	startRegisteredAccountProbeSideEffects(ctx, input.JobID, account.AccountID)
 
 	result.SessionToken = register.SessionToken
 	result.AccessToken = register.AccessToken
@@ -354,6 +404,29 @@ func RegisterAndActivateWorkflow(ctx workflow.Context, input RegisterAndActivate
 	result.ChargeRef = payment.ChargeRef
 	result.SnapToken = payment.SnapToken
 	return result, nil
+}
+
+func startRegisteredAccountProbeSideEffects(ctx workflow.Context, sourceJobID string, accountID string) {
+	if accountID == "" {
+		return
+	}
+	logger := workflow.GetLogger(ctx)
+	startProbeAccountSideEffect(ctx, logger, sourceJobID, accountID)
+}
+
+func startProbeAccountSideEffect(ctx workflow.Context, logger log.Logger, sourceJobID string, accountID string) {
+	jobID := sourceJobID + "-probe"
+	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WorkflowID:        "probe-" + jobID,
+		ParentClosePolicy: enumspb.PARENT_CLOSE_POLICY_ABANDON,
+	})
+	future := workflow.ExecuteChildWorkflow(childCtx, ProbeAccountWorkflow, ProbeAccountWorkflowInput{
+		JobID:     jobID,
+		AccountID: accountID,
+	})
+	if err := future.GetChildWorkflowExecution().Get(ctx, nil); err != nil {
+		logger.Warn("failed to start account probe side effect", "account_id", accountID, "error", err)
+	}
 }
 
 func RegisterMailboxWorkflow(ctx workflow.Context, input RegisterMailboxWorkflowInput) (RegisterMailboxWorkflowResult, error) {
@@ -482,13 +555,7 @@ func failActivateWorkflow(ctx workflow.Context, activityCtx workflow.Context, re
 	return result
 }
 
-func failProbePlusTrialWorkflow(ctx workflow.Context, activityCtx workflow.Context, result ProbePlusTrialWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) ProbePlusTrialWorkflowResult {
-	result.ErrorMessage = err.Error()
-	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
-	return result
-}
-
-func failProbeTierWorkflow(ctx workflow.Context, activityCtx workflow.Context, result ProbeTierWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) ProbeTierWorkflowResult {
+func failProbeAccountWorkflow(ctx workflow.Context, activityCtx workflow.Context, result ProbeAccountWorkflowResult, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) ProbeAccountWorkflowResult {
 	result.ErrorMessage = err.Error()
 	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
 	return result
@@ -516,6 +583,16 @@ func failMailboxOAuthWorkflow(ctx workflow.Context, activityCtx workflow.Context
 	result.ErrorMessage = err.Error()
 	markWorkflowFailure(ctx, activityCtx, jobID, stepName, status, recoverable, retryable, err, data)
 	return result
+}
+
+func activationPaymentData(logonData map[string]any, paymentData map[string]any) map[string]any {
+	if logonData == nil {
+		return paymentData
+	}
+	return map[string]any{
+		"ensure_logon":  logonData,
+		"gopay_payment": paymentData,
+	}
 }
 
 func markWorkflowFailure(ctx workflow.Context, activityCtx workflow.Context, jobID, stepName, status string, recoverable, retryable bool, err error, data map[string]any) {

@@ -8,6 +8,7 @@ message StartGoPayRequest {
   string session_token = 1;
   reserved 2, 3, 4, 5;
   string access_token = 6;
+  bool use_cycle_token = 7;
 }
 
 message StartGoPayResponse {

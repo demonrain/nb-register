@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"orchestrator/db"
@@ -39,8 +40,14 @@ func TestManualOTPParamsForJob(t *testing.T) {
 			wantKind:  "payment",
 		},
 		{
+			name:      "register and activate during gopay login",
+			job:       db.Job{Action: actionRegisterAndActivate, LastStep: stepEnsureLogon},
+			wantParam: paymentOTPParam,
+			wantKind:  "payment",
+		},
+		{
 			name:    "unsupported",
-			job:     db.Job{Action: actionProbePlusTrial},
+			job:     db.Job{Action: actionProbeAccount},
 			wantErr: true,
 		},
 	}
@@ -62,4 +69,51 @@ func TestManualOTPParamsForJob(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestManualOTPSubmittedAfter(t *testing.T) {
+	ctx := context.Background()
+
+	fresh := newManualOTPParamStore(map[string]string{
+		paymentOTPParam:            "1234",
+		paymentOTPSubmittedAtParam: "200",
+	})
+	if !manualOTPSubmittedAfter(ctx, fresh, "job-1", paymentOTPParam, paymentOTPSubmittedAtParam, 199) {
+		t.Fatalf("expected fresh manual OTP to pass")
+	}
+	if _, ok := fresh.values[paymentOTPParam]; !ok {
+		t.Fatalf("fresh OTP should not be deleted")
+	}
+
+	stale := newManualOTPParamStore(map[string]string{
+		paymentOTPParam:            "1234",
+		paymentOTPSubmittedAtParam: "100",
+	})
+	if manualOTPSubmittedAfter(ctx, stale, "job-1", paymentOTPParam, paymentOTPSubmittedAtParam, 101) {
+		t.Fatalf("expected stale manual OTP to be rejected")
+	}
+	if _, ok := stale.values[paymentOTPParam]; ok {
+		t.Fatalf("stale OTP should be deleted")
+	}
+	if _, ok := stale.values[paymentOTPSubmittedAtParam]; ok {
+		t.Fatalf("stale submitted_at should be deleted")
+	}
+}
+
+type manualOTPParamStore struct {
+	values map[string]string
+}
+
+func newManualOTPParamStore(values map[string]string) *manualOTPParamStore {
+	return &manualOTPParamStore{values: values}
+}
+
+func (s *manualOTPParamStore) getJobParam(ctx context.Context, jobID, key string) (string, bool, error) {
+	value, ok := s.values[key]
+	return value, ok, nil
+}
+
+func (s *manualOTPParamStore) deleteJobParam(ctx context.Context, jobID, key string) error {
+	delete(s.values, key)
+	return nil
 }

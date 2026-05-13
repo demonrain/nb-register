@@ -7,6 +7,7 @@ from gopay import (
     GoPayCharger,
     GoPayError,
     GoPayOTPRejected,
+    _extract_passive_captcha_config,
     _extract_midtrans_charge_reference,
     _midtrans_charge_denial_message,
     _request_with_retries,
@@ -55,12 +56,31 @@ class FakeChatGPTSession:
         self.headers = {"User-Agent": "test-agent"}
         self.proxies = {}
         self.closed = False
+        self.posts = []
 
     def post(self, *args, **kwargs):
-        return FakeResponse(200, payload={"checkout_session_id": "cs_test_probe"})
+        self.posts.append((args, kwargs))
+        return FakeResponse(200, payload={
+            "url": "https://checkout.stripe.com/c/pay/cs_test_probe#fidkdWxOYHwnPyd1",
+        })
 
     def close(self):
         self.closed = True
+
+
+class CapturingPostSession:
+    def __init__(self, response):
+        self.response = response
+        self.headers = {"User-Agent": "test-agent"}
+        self.proxies = {}
+        self.posts = []
+
+    def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
+        return self.response
+
+    def close(self):
+        pass
 
 
 class FlakySession:
@@ -191,6 +211,32 @@ class MidtransChargeReferenceTests(unittest.TestCase):
 
 
 class StripeExpectedAmountTests(unittest.TestCase):
+    def test_create_checkout_uses_hosted_plus_promo_shape_and_checkout_proxy(self):
+        chatgpt = FakeChatGPTSession()
+        charger = GoPayCharger(
+            chatgpt,
+            {"country_code": "0", "phone_number": "0", "pin": "0"},
+            otp_provider=lambda: "",
+            checkout_proxy="socks5://checkout",
+            payment_proxy="socks5://payment",
+            log=lambda _msg: None,
+        )
+
+        try:
+            cs_id = charger._chatgpt_create_checkout()
+        finally:
+            charger.close()
+
+        self.assertEqual(cs_id, "cs_test_probe")
+        self.assertEqual(charger.checkout_url, "https://checkout.stripe.com/c/pay/cs_test_probe#fidkdWxOYHwnPyd1")
+        self.assertEqual(chatgpt.proxies, {"http": "socks5://checkout", "https": "socks5://checkout"})
+        body = chatgpt.posts[0][1]["json"]
+        self.assertEqual(body["plan_name"], "chatgptplusplan")
+        self.assertEqual(body["billing_details"], {"country": "ID", "currency": "IDR"})
+        self.assertEqual(body["promo_campaign"]["promo_campaign_id"], "plus-1-month-free")
+        self.assertEqual(body["checkout_ui_mode"], "hosted")
+        self.assertEqual(body["cancel_url"], "https://chatgpt.com/#pricing")
+
     def test_uses_zero_amount_from_checkout_session(self):
         amount, source = _resolve_expected_amount(
             {"currency": "idr", "checkout_session": {"amount_total": 0}},
@@ -199,6 +245,19 @@ class StripeExpectedAmountTests(unittest.TestCase):
 
         self.assertEqual(amount, "0")
         self.assertEqual(source, "checkout_session.amount_total")
+
+    def test_prefers_total_summary_due_over_invoice_amount_due(self):
+        amount, source = _resolve_expected_amount(
+            {
+                "currency": "idr",
+                "total_summary": {"due": 0, "total": 34900000},
+                "invoice": {"amount_due": 34900000},
+            },
+            {},
+        )
+
+        self.assertEqual(amount, "0")
+        self.assertEqual(source, "total_summary.due")
 
     def test_refuses_nonzero_amount_by_default(self):
         with self.assertRaises(GoPayError) as raised:
@@ -236,6 +295,103 @@ class StripeExpectedAmountTests(unittest.TestCase):
 
         self.assertIn("sent expected_amount=0", detail)
         self.assertIn("another checkout", detail)
+
+
+class PassiveCaptchaTests(unittest.TestCase):
+    def test_extracts_passive_captcha_from_init_payload(self):
+        cfg = _extract_passive_captcha_config({
+            "passive_captcha": {
+                "site_key": "site-key-1",
+                "rqdata": "rq-data-1",
+            },
+        })
+
+        self.assertEqual(cfg["site_key"], "site-key-1")
+        self.assertEqual(cfg["rqdata"], "rq-data-1")
+        self.assertTrue(cfg["is_invisible"])
+        self.assertIn("HCaptchaInvisible.html", cfg["website_url"])
+
+    def test_passive_captcha_uses_browser_solver(self):
+        charger = GoPayCharger.__new__(GoPayCharger)
+        charger.browser_challenge_cfg = {"enabled": True, "use_for_passive_captcha": True}
+        charger._midtrans_merchant_id = "merchant-1"
+        charger.browser_locale = "en-US"
+        charger.log = lambda _msg: None
+        init_data = {"passive_captcha": {"site_key": "site-key-1", "rqdata": "rq-data-1"}}
+
+        with patch("gopay._solve_passive_hcaptcha_in_browser", return_value=("token-1", "ekey-1")) as solve:
+            token, ekey = GoPayCharger._solve_passive_confirm_captcha(charger, init_data)
+
+        self.assertEqual((token, ekey), ("token-1", "ekey-1"))
+        self.assertEqual(solve.call_args.kwargs["browser_cfg"], charger.browser_challenge_cfg)
+        self.assertEqual(solve.call_args.kwargs["merchant_id"], "merchant-1")
+
+    def test_stripe_confirm_sends_passive_captcha_token(self):
+        ext = CapturingPostSession(FakeResponse(200, payload={"payment_status": "open"}))
+        charger = GoPayCharger.__new__(GoPayCharger)
+        charger.ext = ext
+        charger.runtime = {}
+        charger.log = lambda _msg: None
+        charger._stripe_init = lambda _cs, _pk: {
+            "init_checksum": "chk",
+            "currency": "idr",
+            "payment_method_types": ["gopay"],
+            "checkout_session": {"amount_total": 0},
+        }
+        charger._solve_passive_confirm_captcha = lambda _init: ("captcha-token", "captcha-ekey")
+
+        GoPayCharger._stripe_confirm(
+            charger,
+            "cs_test",
+            "pm_test",
+            "pk_test",
+            force_passive_captcha=True,
+        )
+
+        body = ext.posts[0][1]["data"]
+        self.assertEqual(body["passive_captcha_token"], "captcha-token")
+        self.assertEqual(body["passive_captcha_ekey"], "captcha-ekey")
+
+    def test_start_until_otp_retries_confirm_with_passive_captcha_on_approve_blocked(self):
+        charger = GoPayCharger.__new__(GoPayCharger)
+        charger.log = lambda _msg: None
+        charger.pre_solve_passive_captcha = False
+        charger._chatgpt_create_checkout = lambda: "cs_test"
+
+        pm_calls = []
+        charger._stripe_create_pm = lambda _cs, _pk, _billing: (
+            pm_calls.append(True) or f"pm_{len(pm_calls)}"
+        )
+
+        confirm_calls = []
+
+        def fake_confirm(_cs, pm_id, _pk, *, force_passive_captcha=False, **_kwargs):
+            confirm_calls.append((pm_id, force_passive_captcha))
+            return {}
+
+        charger._stripe_confirm = fake_confirm
+        charger._extract_redirect_to_url = lambda _data: ""
+
+        approve_calls = []
+
+        def fake_approve(_cs):
+            approve_calls.append(True)
+            if len(approve_calls) == 1:
+                raise GoPayError("chatgpt approve: result='blocked'")
+
+        charger._chatgpt_approve = fake_approve
+        charger._follow_redirect_to_midtrans = lambda _cs, _pk: "snap"
+        charger.start_linking_until_otp = lambda snap, cs, pk: {
+            "snap_token": snap,
+            "cs_id": cs,
+            "stripe_pk": pk,
+        }
+
+        result = GoPayCharger.start_until_otp(charger, "pk_test", billing={})
+
+        self.assertEqual(confirm_calls, [("pm_1", False), ("pm_2", True)])
+        self.assertEqual(len(approve_calls), 2)
+        self.assertEqual(result["snap_token"], "snap")
 
 
 class PlusTrialProbeTests(unittest.TestCase):

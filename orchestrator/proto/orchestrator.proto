@@ -62,21 +62,11 @@ message LoginAccountResponse {
   string error_message = 3;
 }
 
-message ProbePlusTrialRequest {
+message ProbeAccountRequest {
   string account_id = 1;
 }
 
-message ProbePlusTrialResponse {
-  string job_id = 1;
-  bool started = 2;
-  string error_message = 3;
-}
-
-message ProbeTierRequest {
-  string account_id = 1;
-}
-
-message ProbeTierResponse {
+message ProbeAccountResponse {
   string job_id = 1;
   bool started = 2;
   string error_message = 3;
@@ -99,6 +89,41 @@ message RegisterAndActivateAccountResponse {
   string charge_ref = 7;
   string snap_token = 8;
   string access_token = 9;
+}
+
+// === 编排层 GoPay Logon（Temporal activity payload）===
+
+message CycleStatusSnapshot {
+  string stage = 1;
+  string phone = 2;
+  bool token_present = 3;
+  string device_fingerprint = 4;
+  int64 deactivated_at = 5;
+  string error_message = 6;
+  int64 balance_amount = 7;
+  bool has_min_balance = 8;
+  string balance_currency = 9;
+}
+
+message EnsureLogonRequest {
+  string job_id = 1;
+  string account_id = 2;
+}
+
+message EnsureLogonResponse {
+  bool ready = 1;
+  string stage = 2;
+  string phone = 3;
+  CycleStatusSnapshot status_before = 4;
+  CycleStatusSnapshot status_after = 5;
+  bool already_ready = 6;
+  bool change_phone_complete = 7;
+  bool deactivate_complete = 8;
+  bool logon_complete = 9;
+  bool cycle_token_ready = 10;
+  string error_message = 11;
+  bool signup_complete = 12;
+  bool signup_pin_complete = 13;
 }
 
 message JobStep {
@@ -211,8 +236,7 @@ service OrchestratorService {
   rpc RegisterAccount(RegisterAccountRequest) returns (RegisterAccountResponse);
   rpc ActivateAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
   rpc LoginAccount(LoginAccountRequest) returns (LoginAccountResponse);
-  rpc ProbePlusTrial(ProbePlusTrialRequest) returns (ProbePlusTrialResponse);
-  rpc ProbeTier(ProbeTierRequest) returns (ProbeTierResponse);
+  rpc ProbeAccount(ProbeAccountRequest) returns (ProbeAccountResponse);
   rpc RegisterAndActivateAccount(RegisterAndActivateAccountRequest) returns (RegisterAndActivateAccountResponse);
   rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
   rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);

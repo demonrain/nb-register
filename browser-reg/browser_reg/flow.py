@@ -28,6 +28,7 @@ import tempfile
 import shutil
 from typing import Any, Callable, Optional
 
+from browser_reg.cookies import extract_session_token
 from browser_reg.sensitive import redact_email, sanitize_text, sanitize_url_for_log
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"1", "true", "yes", "on"}
+
+
+def _is_playwright_target_closed_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "target page, context or browser has been closed" in text
+        or "page has been closed" in text
+        or "browser has been closed" in text
+        or "context has been closed" in text
+    )
 
 
 def _parse_checkout_amount(value: Any) -> Optional[int]:
@@ -281,6 +292,79 @@ def browser_register(
     def sleep(seconds: float) -> None:
         _interruptible_sleep(float(seconds), check_cancel)
 
+    ctx = None
+    page = None
+
+    def _active_page():
+        nonlocal page
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception as e:
+                if not _is_playwright_target_closed_error(e):
+                    raise
+
+        if ctx is None:
+            raise RuntimeError("browser context is not available")
+
+        try:
+            pages = [p for p in ctx.pages if not p.is_closed()]
+        except Exception as e:
+            raise RuntimeError(f"browser context is closed: {sanitize_text(e)}") from e
+        if not pages:
+            raise RuntimeError("browser page closed and no replacement page is available")
+
+        page = pages[-1]
+        logger.info("[browser-reg] Switched to active browser page")
+        return page
+
+    def _with_active_page(action):
+        nonlocal page
+        last_error = None
+        for attempt in range(2):
+            try:
+                return action(_active_page())
+            except Exception as e:
+                if attempt == 0 and _is_playwright_target_closed_error(e):
+                    last_error = e
+                    page = None
+                    continue
+                raise
+        raise last_error
+
+    def _query_selector(selector: str):
+        return _with_active_page(lambda p: p.query_selector(selector))
+
+    def _query_selector_all(selector: str):
+        return _with_active_page(lambda p: p.query_selector_all(selector))
+
+    def _page_url() -> str:
+        return _with_active_page(lambda p: p.url)
+
+    def _page_evaluate(script: str, *args):
+        return _with_active_page(lambda p: p.evaluate(script, *args))
+
+    def _wait_for_selector(selector: str, **kwargs):
+        return _with_active_page(lambda p: p.wait_for_selector(selector, **kwargs))
+
+    def _page_screenshot(path: str) -> bool:
+        try:
+            _with_active_page(lambda p: p.screenshot(path=path))
+            return True
+        except Exception as e:
+            logger.info(f"[browser-reg] Screenshot failed: {sanitize_text(e)}")
+            return False
+
+    def _body_inner_text(timeout: int) -> str:
+        return _with_active_page(lambda p: p.locator("body").inner_text(timeout=timeout))
+
+    def _keyboard_press(key: str) -> None:
+        _with_active_page(lambda p: p.keyboard.press(key))
+
+    def _keyboard_type(text: str, delay: int) -> None:
+        _with_active_page(lambda p: p.keyboard.type(text, delay=delay))
+
     def _js_fill_input(element, value: str) -> None:
         element.evaluate(
             """(el, value) => {
@@ -319,9 +403,9 @@ def browser_register(
         try:
             element.focus()
             sleep(0.1)
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Delete")
-            page.keyboard.type(value, delay=random.randint(20, 60))
+            _keyboard_press("Control+A")
+            _keyboard_press("Delete")
+            _keyboard_type(value, delay=random.randint(20, 60))
             return True
         except Exception as e:
             logger.warning(f"[browser-reg] Keyboard input fill failed: {sanitize_text(e)}")
@@ -329,7 +413,7 @@ def browser_register(
 
     def _safe_click(element, label: str, timeout: int = 5000) -> bool:
         try:
-            element.click(timeout=timeout)
+            element.click(timeout=timeout, force=True)
             return True
         except Exception as e:
             logger.info(f"[browser-reg] {label} click failed, trying JS click: {sanitize_text(e)}")
@@ -342,7 +426,10 @@ def browser_register(
 
     try:
         import platform as _platform
-        _headless = "virtual" if _platform.system() == "Linux" else False
+        _debug_mode = _env_bool("BROWSER_REG_DEBUG", False)
+        _headless = False if _debug_mode else ("virtual" if _platform.system() == "Linux" else False)
+        if _debug_mode:
+            logger.info("[browser-reg] Debug mode enabled: headless=False")
 
         check_cancel()
         with Camoufox(
@@ -360,7 +447,7 @@ def browser_register(
 
             def _capture_session_state(label: str) -> bool:
                 try:
-                    session_info = page.evaluate('''async () => {
+                    session_info = _page_evaluate('''async () => {
                         const controller = new AbortController();
                         const timer = setTimeout(() => controller.abort(), 8000);
                         try {
@@ -390,10 +477,14 @@ def browser_register(
                     all_cookies = []
 
                 chatgpt_cookies = [c for c in all_cookies if "chatgpt.com" in c.get("domain", "")]
+                if _env_bool("BROWSER_REG_DEBUG", False):
+                    logger.info(
+                        "[browser-reg] Cookie names: %s",
+                        ", ".join(sorted({str(c.get("name", "")) for c in chatgpt_cookies if c.get("name")})),
+                    )
+                result["session_token"] = extract_session_token(chatgpt_cookies)
                 for c in chatgpt_cookies:
                     n = c["name"]
-                    if n == "__Secure-next-auth.session-token":
-                        result["session_token"] = c["value"]
                     if n in ("oai-did", "oai-device-id"):
                         result["device_id"] = c["value"]
                     if n == "__Host-next-auth.csrf-token":
@@ -414,9 +505,9 @@ def browser_register(
 
             # --- [1] Open ChatGPT homepage, click "Sign up" ---
             logger.info("[browser-reg] Opening chatgpt.com ...")
-            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            _with_active_page(lambda p: p.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000))
             try:
-                page.wait_for_selector(
+                _wait_for_selector(
                     'button[data-testid="signup-button"], a[data-testid="signup-button"]',
                     state="visible", timeout=20000,
                 )
@@ -434,7 +525,7 @@ def browser_register(
                 'a:has-text("Sign up")',
             ]:
                 try:
-                    btns = page.query_selector_all(sel)
+                    btns = _query_selector_all(sel)
                 except Exception:
                     continue
                 for btn in btns:
@@ -459,41 +550,58 @@ def browser_register(
                     break
 
             if not clicked_signup:
-                page.screenshot(path=f"{screenshot_dir}/no_signup.png")
-                raise RuntimeError(f"Sign up button not found, URL={sanitize_url_for_log(page.url)}")
+                _page_screenshot(path=f"{screenshot_dir}/no_signup.png")
+                raise RuntimeError(f"Sign up button not found, URL={sanitize_url_for_log(_page_url())}")
+
+            # Handle case where Sign up opens a new tab/popup
+            sleep(1)
+            all_pages = [p for p in ctx.pages if not p.is_closed()]
+            if len(all_pages) > 1:
+                page = all_pages[-1]
+                logger.info("[browser-reg] Sign up opened new page, switching")
 
             # Wait for redirect to auth.openai.com
-            pre_url = page.url
+            pre_url = _page_url()
             for i in range(20):
                 sleep(1)
-                if "auth.openai.com" in page.url or page.query_selector('input[type="email"]'):
-                    break
-                if i == 5 and page.url == pre_url:
+                try:
+                    cur_url = _page_url()
+                    if "auth.openai.com" in cur_url or _query_selector('input[type="email"]'):
+                        break
+                except Exception:
+                    # Page may have been closed; check for new pages
+                    all_pages = [p for p in ctx.pages if not p.is_closed()]
+                    if all_pages:
+                        page = all_pages[-1]
+                        logger.info("[browser-reg] Page closed, switched to remaining page")
+                        break
+                    raise
+                if i == 5 and cur_url == pre_url:
                     logger.info("[browser-reg] Sign up click had no effect, retrying")
                     try:
-                        btn = page.query_selector(
+                        btn = _query_selector(
                             'button[data-testid="signup-button"], a[data-testid="signup-button"]'
                         )
                         if btn:
                             btn.click(timeout=3000)
                     except Exception:
                         pass
-            logger.info(f"[browser-reg] URL: {sanitize_url_for_log(page.url)}")
+            logger.info(f"[browser-reg] URL: {sanitize_url_for_log(_page_url())}")
 
             # --- [2] Fill email ---
             logger.info("[browser-reg] Filling email ...")
-            page.wait_for_selector('input[type="email"], input[name="email"]', timeout=30000)
+            _wait_for_selector('input[type="email"], input[name="email"]', timeout=30000)
             for _try in range(4):
                 try:
-                    ei = (page.query_selector('input[type="email"]')
-                          or page.query_selector('input[name="email"]'))
+                    ei = (_query_selector('input[type="email"]')
+                          or _query_selector('input[name="email"]'))
                     if not ei:
                         sleep(0.5)
                         continue
                     ei.click(timeout=5000)
                     sleep(0.3)
-                    ei2 = (page.query_selector('input[type="email"]')
-                           or page.query_selector('input[name="email"]'))
+                    ei2 = (_query_selector('input[type="email"]')
+                           or _query_selector('input[name="email"]'))
                     (ei2 or ei).fill(email)
                     break
                 except Exception as e:
@@ -505,7 +613,7 @@ def browser_register(
             sleep(random.uniform(0.5, 1.2))
 
             for sel in ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")']:
-                b = page.query_selector(sel)
+                b = _query_selector(sel)
                 if b and b.is_visible():
                     b.click()
                     logger.info(f"[browser-reg] Email continue: {sel}")
@@ -518,16 +626,16 @@ def browser_register(
             # We click "Continue with password" to skip first OTP.
             logger.info("[browser-reg] Waiting for auth.openai.com redirect ...")
             try:
-                page.wait_for_url("**/auth.openai.com/**", timeout=30000)
+                _with_active_page(lambda p: p.wait_for_url("**/auth.openai.com/**", timeout=30000))
             except Exception:
                 pass
-            logger.info(f"[browser-reg] Reached auth page: {sanitize_url_for_log(page.url)}")
+            logger.info(f"[browser-reg] Reached auth page: {sanitize_url_for_log(_page_url())}")
 
             def _password_input_ready() -> bool:
                 try:
                     return bool(
-                        page.query_selector('input[type="password"]:visible')
-                        or page.query_selector('input[name="password"]:visible')
+                        _query_selector('input[type="password"]:visible')
+                        or _query_selector('input[name="password"]:visible')
                     )
                 except Exception:
                     return False
@@ -544,7 +652,7 @@ def browser_register(
                     'a:has-text("Password")',
                 ]:
                     try:
-                        el = page.query_selector(sel)
+                        el = _query_selector(sel)
                         if el and el.is_visible() and _safe_click(el, f"Password flow {sel}", timeout=1500):
                             logger.info(f"[browser-reg] Switched to password flow: {sel}")
                             return True
@@ -552,7 +660,7 @@ def browser_register(
                         continue
 
                 try:
-                    return bool(page.evaluate('''() => {
+                    return bool(_page_evaluate('''() => {
                         const els = document.querySelectorAll('a, button, div[role="button"]');
                         for (const el of els) {
                             const rect = el.getBoundingClientRect();
@@ -593,7 +701,7 @@ def browser_register(
             # Click "Continue with password" as soon as it appears.
             if not _password_input_ready():
                 try:
-                    page.wait_for_selector(
+                    _wait_for_selector(
                         password_or_switch_selector,
                         state="visible",
                         timeout=password_switch_timeout_ms,
@@ -602,11 +710,11 @@ def browser_register(
                     pass
                 check_cancel()
                 if not _password_input_ready() and not _click_password_flow():
-                    page.screenshot(path=f"{screenshot_dir}/no_password_link.png")
+                    _page_screenshot(path=f"{screenshot_dir}/no_password_link.png")
                     raise RuntimeError("Continue with password button not found")
                 if not _password_input_ready():
                     try:
-                        page.wait_for_selector(
+                        _wait_for_selector(
                             'input[type="password"], input[name="password"]',
                             state="visible",
                             timeout=password_input_after_switch_timeout_ms,
@@ -614,19 +722,19 @@ def browser_register(
                     except Exception:
                         pass
                 if not _password_input_ready():
-                    page.screenshot(path=f"{screenshot_dir}/password_input_after_switch_missing.png")
+                    _page_screenshot(path=f"{screenshot_dir}/password_input_after_switch_missing.png")
                     raise RuntimeError("Password input did not appear after Continue with password")
 
             # --- [4] Set password ---
             logger.info("[browser-reg] Waiting for password field ...")
             try:
                 if not _password_input_ready():
-                    page.wait_for_selector(
+                    _wait_for_selector(
                         'input[type="password"], input[name="password"]',
                         state="visible", timeout=password_input_final_timeout_ms,
                     )
-                pwd_input = (page.query_selector('input[type="password"]:visible')
-                             or page.query_selector('input[name="password"]:visible'))
+                pwd_input = (_query_selector('input[type="password"]:visible')
+                             or _query_selector('input[name="password"]:visible'))
                 pwd_input.click()
                 pwd_input.fill(password)
                 sleep(random.uniform(0.5, 1.2))
@@ -634,7 +742,7 @@ def browser_register(
                     'button[type="submit"]', 'button:has-text("Continue")',
                     'button:has-text("Create")', 'button:has-text("Next")',
                 ]:
-                    b = page.query_selector(sel)
+                    b = _query_selector(sel)
                     if b and b.is_visible():
                         b.click()
                         logger.info(f"[browser-reg] Password continue: {sel}")
@@ -642,17 +750,17 @@ def browser_register(
                 logger.info("[browser-reg] Password set successfully")
             except Exception as e:
                 logger.warning(f"[browser-reg] Password field not found: {sanitize_text(e)}")
-                page.screenshot(path=f"{screenshot_dir}/no_password.png")
+                _page_screenshot(path=f"{screenshot_dir}/no_password.png")
 
             sleep(1)
-            logger.info(f"[browser-reg] Post-password URL: {sanitize_url_for_log(page.url)}")
+            logger.info(f"[browser-reg] Post-password URL: {sanitize_url_for_log(_page_url())}")
 
             # --- [5] Second OTP (after password, for email verification) ---
             def _is_email_code_page() -> bool:
-                if "auth.openai.com/email-verification" not in page.url:
+                if "auth.openai.com/email-verification" not in _page_url():
                     return False
                 try:
-                    body_text = page.locator("body").inner_text(timeout=1000).lower()
+                    body_text = _body_inner_text(timeout=1000).lower()
                 except Exception:
                     body_text = ""
                 return (
@@ -672,7 +780,7 @@ def browser_register(
                     'input:not([type="hidden"]):not([type="password"]):visible',
                 ]:
                     try:
-                        el = page.query_selector(sel)
+                        el = _query_selector(sel)
                         if el and el.is_visible():
                             return el
                     except Exception:
@@ -686,7 +794,8 @@ def browser_register(
                     if _find_otp_input() or _is_email_code_page():
                         logger.info("[browser-reg] Second OTP page reached")
                         break
-                    if "chatgpt.com" in page.url and "auth.openai.com" not in page.url:
+                    cur_url = _page_url()
+                    if "chatgpt.com" in cur_url and "auth.openai.com" not in cur_url:
                         logger.info("[browser-reg] Already at chatgpt.com, skipping OTP")
                         break
                 except Exception as e:
@@ -694,7 +803,7 @@ def browser_register(
                         continue
                     logger.warning(f"[browser-reg] OTP poll error: {sanitize_text(e)}")
                 if wait_i == 15:
-                    page.screenshot(path=f"{screenshot_dir}/wait_otp2.png")
+                    _page_screenshot(path=f"{screenshot_dir}/wait_otp2.png")
 
             if _find_otp_input() or _is_email_code_page():
                 logger.info("[browser-reg] Waiting for second OTP ...")
@@ -727,7 +836,7 @@ def browser_register(
                         'input[maxlength="1"]',
                     ]:
                         try:
-                            digits = [el for el in page.query_selector_all(sel) if el.is_visible()]
+                            digits = [el for el in _query_selector_all(sel) if el.is_visible()]
                         except Exception:
                             digits = []
                         if len(digits) >= 6:
@@ -748,7 +857,7 @@ def browser_register(
                 if otp_filled:
                     logger.info("[browser-reg] OTP input filled")
                 else:
-                    page.screenshot(path=f"{screenshot_dir}/otp2_fail.png")
+                    _page_screenshot(path=f"{screenshot_dir}/otp2_fail.png")
                     raise RuntimeError("Second OTP input not found")
 
                 sleep(0.8)
@@ -756,7 +865,7 @@ def browser_register(
                     'button[type="submit"]', 'button:has-text("Continue")',
                     'button:has-text("Verify")', 'button:has-text("Next")',
                 ]:
-                    b = page.query_selector(sel)
+                    b = _query_selector(sel)
                     if b and b.is_visible():
                         if _safe_click(b, "OTP continue"):
                             logger.info(f"[browser-reg] OTP continue: {sel}")
@@ -766,16 +875,17 @@ def browser_register(
             sleep(1)
 
             # --- [6] /about-you: Full name + Birthday ---
-            logger.info(f"[browser-reg] Post-OTP URL: {sanitize_url_for_log(page.url)}")
+            logger.info(f"[browser-reg] Post-OTP URL: {sanitize_url_for_log(_page_url())}")
 
             for _ in range(30):
                 sleep(1)
-                if "about-you" in page.url or "chatgpt.com" in page.url:
+                cur_url = _page_url()
+                if "about-you" in cur_url or "chatgpt.com" in cur_url:
                     break
 
             def _enum_inputs():
                 try:
-                    return page.evaluate('''() => {
+                    return _page_evaluate('''() => {
                         return Array.from(document.querySelectorAll('input')).map((el, idx) => {
                             const r = el.getBoundingClientRect();
                             const cs = getComputedStyle(el);
@@ -819,7 +929,7 @@ def browser_register(
                 name_m = next((m for m in visible_metas if m is not bd and not _is_birthday(m)), None)
 
                 if bd and name_m:
-                    all_inputs_el = page.query_selector_all("input")
+                    all_inputs_el = _query_selector_all("input")
                     full_name_input = all_inputs_el[name_m["idx"]]
                     birthday_input = all_inputs_el[bd["idx"]]
                     birthday_meta = bd
@@ -830,17 +940,18 @@ def browser_register(
                     break
 
                 if not bd and len(visible_metas) >= 2:
-                    all_inputs_el = page.query_selector_all("input")
+                    all_inputs_el = _query_selector_all("input")
                     full_name_input = all_inputs_el[visible_metas[0]["idx"]]
                     birthday_input = all_inputs_el[visible_metas[1]["idx"]]
                     birthday_meta = visible_metas[1]
                     logger.info(f"[browser-reg] Form (legacy age): {len(visible_metas)} inputs")
                     break
 
-                if "chatgpt.com" in page.url and "auth" not in page.url:
+                cur_url = _page_url()
+                if "chatgpt.com" in cur_url and "auth" not in cur_url:
                     break
                 if attempt == 5:
-                    page.screenshot(path=f"{screenshot_dir}/about_you_wait.png")
+                    _page_screenshot(path=f"{screenshot_dir}/about_you_wait.png")
                 sleep(1)
 
             if full_name_input and birthday_input:
@@ -857,14 +968,14 @@ def browser_register(
                 try:
                     full_name_input.focus()
                     sleep(0.3)
-                    page.keyboard.type(full_name, delay=random.randint(30, 80))
+                    _keyboard_type(full_name, delay=random.randint(30, 80))
                     sleep(random.uniform(0.4, 0.9))
 
                     birthday_input.focus()
                     sleep(0.3)
                     try:
-                        page.keyboard.press("Control+A")
-                        page.keyboard.press("Delete")
+                        _keyboard_press("Control+A")
+                        _keyboard_press("Delete")
                     except Exception:
                         pass
 
@@ -872,12 +983,12 @@ def browser_register(
                         try:
                             birthday_input.fill(birthday_str)
                         except Exception:
-                            page.keyboard.type(birthday_str, delay=random.randint(30, 70))
+                            _keyboard_type(birthday_str, delay=random.randint(30, 70))
                     else:
                         if _is_birthday(birthday_meta or {}):
-                            page.keyboard.type(birthday_str, delay=random.randint(30, 70))
+                            _keyboard_type(birthday_str, delay=random.randint(30, 70))
                         else:
-                            page.keyboard.type(legacy_age, delay=random.randint(40, 100))
+                            _keyboard_type(legacy_age, delay=random.randint(40, 100))
 
                     sleep(random.uniform(0.4, 0.9))
                     for sel in [
@@ -885,17 +996,17 @@ def browser_register(
                         'button:has-text("Agree")', 'button[type="submit"]',
                         'button:has-text("Continue")',
                     ]:
-                        b = page.query_selector(sel)
+                        b = _query_selector(sel)
                         if b and b.is_visible():
                             b.click()
                             logger.info(f"[browser-reg] About-you continue: {sel}")
                             break
                 except Exception as e:
                     logger.warning(f"[browser-reg] About-you fill error: {sanitize_text(e)}")
-                    page.screenshot(path=f"{screenshot_dir}/name_fail.png")
+                    _page_screenshot(path=f"{screenshot_dir}/name_fail.png")
             else:
-                page.screenshot(path=f"{screenshot_dir}/no_name_form.png")
-                logger.warning(f"[browser-reg] No about-you form found, URL={sanitize_url_for_log(page.url)}")
+                _page_screenshot(path=f"{screenshot_dir}/no_name_form.png")
+                logger.warning(f"[browser-reg] No about-you form found, URL={sanitize_url_for_log(_page_url())}")
 
             # --- [7] Wait for redirect back to chatgpt.com ---
             logger.info("[browser-reg] Waiting for redirect to chatgpt.com ...")
@@ -903,7 +1014,7 @@ def browser_register(
             last_url = ""
             for i in range(120):
                 sleep(1)
-                cur = page.url
+                cur = _page_url()
                 if cur != last_url:
                     logger.info(f"[browser-reg] URL@{i}s: {sanitize_url_for_log(cur)}")
                     last_url = cur
@@ -915,18 +1026,18 @@ def browser_register(
 
                 if "auth.openai.com" in cur and i % 5 == 0:
                     try:
-                        body_text = page.locator("body").inner_text(timeout=1000)
+                        body_text = _body_inner_text(timeout=1000)
                     except Exception:
                         body_text = ""
                     if "user_already_exists" in body_text:
-                        page.screenshot(path=f"{screenshot_dir}/user_already_exists.png")
+                        _page_screenshot(path=f"{screenshot_dir}/user_already_exists.png")
                         raise RuntimeError("account already exists")
 
                 if "auth.openai.com" in cur and i % 10 == 5:
                     for sel in ['button:has-text("Continue")', 'button:has-text("Next")',
                                 'button[type="submit"]']:
                         try:
-                            b = page.query_selector(sel)
+                            b = _query_selector(sel)
                             if b and b.is_visible():
                                 b.click()
                                 logger.info(f"[browser-reg] Intermediate click: {sel}")
@@ -936,20 +1047,17 @@ def browser_register(
 
             if not arrived:
                 try:
-                    body_text = page.locator("body").inner_text(timeout=3000)
+                    body_text = _body_inner_text(timeout=3000)
                 except Exception:
                     body_text = ""
 
                 if "user_already_exists" in body_text:
-                    page.screenshot(path=f"{screenshot_dir}/user_already_exists.png")
+                    _page_screenshot(path=f"{screenshot_dir}/user_already_exists.png")
                     raise RuntimeError("account already exists")
 
             if not arrived:
-                try:
-                    page.screenshot(path=f"{screenshot_dir}/no_chatgpt.png")
-                except Exception:
-                    pass
-                raise RuntimeError(f"Did not redirect to chatgpt.com, current={sanitize_url_for_log(page.url)}")
+                _page_screenshot(path=f"{screenshot_dir}/no_chatgpt.png")
+                raise RuntimeError(f"Did not redirect to chatgpt.com, current={sanitize_url_for_log(_page_url())}")
 
             # --- [8] Refresh credentials if arrival capture was partial ---
             if not result["access_token"] or not result["session_token"]:
@@ -961,7 +1069,7 @@ def browser_register(
             if result["access_token"] and _env_bool("BROWSER_CHECK_PLUS_TRIAL", False):
                 try:
                     stripe_pk = (os.environ.get("STRIPE_PUBLISHABLE_KEY") or DEFAULT_STRIPE_PK).strip()
-                    trial_info = page.evaluate('''async ({token, stripePk, deviceId}) => {
+                    trial_info = _page_evaluate('''async ({token, stripePk, deviceId}) => {
                         try {
                             const resp = await fetch('/backend-api/payments/checkout', {
                                 method: 'POST',
@@ -1113,10 +1221,7 @@ def browser_register(
             # access_token is derived from that cookie and can be refreshed by
             # the dashboard later, so it must not make registration fail.
             if not result["session_token"]:
-                try:
-                    page.screenshot(path=f"{screenshot_dir}/missing_token.png")
-                except Exception:
-                    pass
+                _page_screenshot(path=f"{screenshot_dir}/missing_token.png")
                 raise RuntimeError(
                     f"Missing credentials: access_token={bool(result['access_token'])} "
                     f"session_token={bool(result['session_token'])}"

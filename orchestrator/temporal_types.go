@@ -18,7 +18,9 @@ type EnsureAccountInput struct {
 }
 
 type AccountRef struct {
-	AccountID string
+	AccountID         string
+	PlusTrialKnown    bool
+	PlusTrialEligible bool
 }
 
 type ResolveAccountInput struct {
@@ -42,10 +44,11 @@ type RegisterActivityOutput struct {
 }
 
 type GoPayActivityInput struct {
-	JobID        string
-	AccountID    string
-	SessionToken string
-	AccessToken  string
+	JobID         string
+	AccountID     string
+	SessionToken  string
+	AccessToken   string
+	UseCycleToken bool
 }
 
 type GoPayActivityOutput struct {
@@ -199,12 +202,7 @@ type ActivateAccountWorkflowResult struct {
 	SnapToken    string
 }
 
-type ProbePlusTrialWorkflowInput struct {
-	JobID     string
-	AccountID string
-}
-
-type ProbeTierWorkflowInput struct {
+type ProbeAccountWorkflowInput struct {
 	JobID     string
 	AccountID string
 }
@@ -221,11 +219,13 @@ type LoginSessionWorkflowResult struct {
 	ErrorMessage string
 }
 
-type ProbePlusTrialWorkflowResult struct {
+type ProbeAccountWorkflowResult struct {
 	JobID             string
 	Success           bool
-	Checked           bool
+	PlusTrialChecked  bool
 	PlusTrialEligible bool
+	TierChecked       bool
+	Tier              string
 	PlusActive        bool
 	Amount            int64
 	Currency          string
@@ -233,16 +233,6 @@ type ProbePlusTrialWorkflowResult struct {
 	PlanType          string
 	CheckoutURL       string
 	ErrorMessage      string
-}
-
-type ProbeTierWorkflowResult struct {
-	JobID        string
-	Success      bool
-	Checked      bool
-	Tier         string
-	PlusActive   bool
-	Source       string
-	ErrorMessage string
 }
 
 type RegisterAndActivateWorkflowInput struct {

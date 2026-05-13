@@ -113,19 +113,19 @@ const (
 func main() {
 	ctx := context.Background()
 
-	accountConn, err := grpc.NewClient(envDefault("ACCOUNT_DB_ADDR", "account-db:50051"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	accountConn, err := newGRPCClient(envDefault("ACCOUNT_DB_ADDR", "account-db:50051"))
 	if err != nil {
 		log.Fatalf("connect account-db: %v", err)
 	}
 	defer accountConn.Close()
 
-	orchestratorConn, err := grpc.NewClient(envDefault("ORCHESTRATOR_ADDR", "orchestrator:50051"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	orchestratorConn, err := newGRPCClient(envDefault("ORCHESTRATOR_ADDR", "orchestrator:50051"))
 	if err != nil {
 		log.Fatalf("connect orchestrator: %v", err)
 	}
 	defer orchestratorConn.Close()
 
-	emailConn, err := grpc.NewClient(envDefault("EMAIL_ADDR", "outlook-imap-service:50051"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	emailConn, err := newGRPCClient(envDefault("EMAIL_ADDR", "outlook-imap-service:50051"))
 	if err != nil {
 		log.Fatalf("connect email service: %v", err)
 	}
@@ -162,8 +162,7 @@ func main() {
 	mux.HandleFunc("/api/workflows/register", s.handleRegister)
 	mux.HandleFunc("/api/workflows/activate", s.handleActivate)
 	mux.HandleFunc("/api/workflows/login", s.handleLogin)
-	mux.HandleFunc("/api/workflows/probe-plus-trial", s.handleProbePlusTrial)
-	mux.HandleFunc("/api/workflows/probe-tier", s.handleProbeTier)
+	mux.HandleFunc("/api/workflows/probe", s.handleProbeAccount)
 	mux.HandleFunc("/api/workflows/register-and-activate", s.handleRegisterAndActivate)
 	mux.HandleFunc("/", s.handleStatic)
 
@@ -842,15 +841,8 @@ func (s *server) retryJob(w http.ResponseWriter, r *http.Request, jobID string) 
 			return
 		}
 		writeJSON(w, http.StatusOK, resp)
-	case "PROBE_PLUS_TRIAL":
-		resp, err := s.orchestratorClient.ProbePlusTrial(r.Context(), &pb.ProbePlusTrialRequest{AccountId: job.AccountID})
-		if err != nil {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, resp)
-	case "PROBE_TIER":
-		resp, err := s.orchestratorClient.ProbeTier(r.Context(), &pb.ProbeTierRequest{AccountId: job.AccountID})
+	case "PROBE_ACCOUNT":
+		resp, err := s.orchestratorClient.ProbeAccount(r.Context(), &pb.ProbeAccountRequest{AccountId: job.AccountID})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return
@@ -926,39 +918,17 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, statusCode, resp)
 }
 
-func (s *server) handleProbePlusTrial(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleProbeAccount(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	var req pb.ProbePlusTrialRequest
+	var req pb.ProbeAccountRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.ProbePlusTrial(r.Context(), &req)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-	statusCode := http.StatusAccepted
-	if !resp.GetStarted() || resp.GetErrorMessage() != "" {
-		statusCode = http.StatusBadGateway
-	}
-	writeJSON(w, statusCode, resp)
-}
-
-func (s *server) handleProbeTier(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	var req pb.ProbeTierRequest
-	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	resp, err := s.orchestratorClient.ProbeTier(r.Context(), &req)
+	resp, err := s.orchestratorClient.ProbeAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -1098,6 +1068,20 @@ func queryInt(r *http.Request, key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func newGRPCClient(addr string) (*grpc.ClientConn, error) {
+	return grpc.NewClient(grpcDialTarget(addr), grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+func grpcDialTarget(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || strings.Contains(addr, "://") || strings.HasPrefix(addr, "passthrough:") {
+		return addr
+	}
+	// Let Docker DNS resolve the service name on each TCP reconnect instead of
+	// caching a container IP inside gRPC's DNS resolver.
+	return "passthrough:///" + addr
 }
 
 func envDefault(key string, fallback string) string {

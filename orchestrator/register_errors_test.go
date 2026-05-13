@@ -29,3 +29,14 @@ func TestRegisterFailurePolicyMarksAccountExistsFinal(t *testing.T) {
 		t.Fatalf("recoverable=%v retryable=%v; want both false", recoverable, retryable)
 	}
 }
+
+func TestIsUserAlreadyExistsStatus(t *testing.T) {
+	for _, status := range []string{"USER_ALREADY_EXISTS", " user_already_exists ", "EMAIL_ALREADY_EXISTS"} {
+		if !isUserAlreadyExistsStatus(status) {
+			t.Fatalf("expected %q to be treated as user already exists", status)
+		}
+	}
+	if isUserAlreadyExistsStatus(accountStatusRegistered) {
+		t.Fatalf("%q should not be treated as user already exists", accountStatusRegistered)
+	}
+}

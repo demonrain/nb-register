@@ -161,7 +161,7 @@ type RowActionDescriptor = {
   kind?: 'primary' | 'secondary' | 'danger';
 };
 
-const statusOptions = ['', 'CREATED', 'REGISTERED', 'ACTIVATED', 'DEACTIVATED', 'EMAIL_ALREADY_EXISTS', 'REGISTER_FAILED', 'PAYMENT_FAILED'];
+const statusOptions = ['', 'CREATED', 'REGISTERED', 'ACTIVATED', 'DEACTIVATED', 'USER_ALREADY_EXISTS', 'REGISTER_FAILED', 'PAYMENT_FAILED'];
 const jobStatusOptions = ['', 'RUNNING', 'SUCCEEDED', 'FAILED_RETRYABLE', 'FAILED_RECOVERABLE', 'FAILED_FINAL'];
 const mailboxStatusOptions = ['', 'AVAILABLE', 'ASSIGNED', 'REGISTERED', 'USER_ALREADY_EXISTS', 'REGISTRATION_FAILED', 'BLOCKED', 'AUTHORIZED', 'OAUTH_PENDING', 'AUTH_FAILED', 'NEEDS_MANUAL_VERIFICATION'];
 const mailboxUsageStatusOptions = ['AVAILABLE', 'ASSIGNED', 'REGISTERED', 'USER_ALREADY_EXISTS', 'REGISTRATION_FAILED', 'BLOCKED'];
@@ -171,7 +171,8 @@ const accountStatusLabels: DisplayLabelMap = {
   REGISTERED: '已注册',
   ACTIVATED: '已激活',
   DEACTIVATED: '已停用',
-  EMAIL_ALREADY_EXISTS: '邮箱已存在',
+  USER_ALREADY_EXISTS: '用户已存在',
+  EMAIL_ALREADY_EXISTS: '用户已存在',
   REGISTER_FAILED: '注册失败',
   PAYMENT_FAILED: '支付失败'
 };
@@ -202,8 +203,7 @@ const actionLabels: DisplayLabelMap = {
   LOGIN_SESSION: '登录取 Token',
   ACTIVATE: '激活支付',
   REGISTER_AND_ACTIVATE: '注册并激活',
-  PROBE_PLUS_TRIAL: '探测资格',
-  PROBE_TIER: '探测 Tier',
+  PROBE_ACCOUNT: '探测账号',
   REGISTER_MAILBOX: '注册 Outlook 邮箱',
   MAILBOX_OAUTH: 'Microsoft OAuth'
 };
@@ -211,6 +211,7 @@ const actionLabels: DisplayLabelMap = {
 const stepLabels: DisplayLabelMap = {
   create_email: '创建邮箱',
   wait_outlook_otp: '等待 Outlook OTP',
+  gopay_login: 'GoPay 登录',
   gopay_payment: 'GoPay 支付',
   oauth_exchange: '交换 OAuth Token',
   captcha: '验证码/风控验证'
@@ -599,8 +600,7 @@ function App() {
                   onRegister={(account) => runAccountWorkflow('注册账号', '/api/workflows/register', account)}
                   onLogin={(account) => runAccountWorkflow(loginActionLabel(account), '/api/workflows/login', account)}
                   onActivate={(account) => runAccountWorkflow('激活账号', '/api/workflows/activate', account)}
-                  onProbePlusTrial={(account) => runAccountWorkflow('资格探测', '/api/workflows/probe-plus-trial', account)}
-                  onProbeTier={(account) => runAccountWorkflow('Tier 探测', '/api/workflows/probe-tier', account)}
+                  onProbeAccount={(account) => runAccountWorkflow('探测账号', '/api/workflows/probe', account)}
                   onRegisterActivate={(account) => runAccountWorkflow('注册并激活', '/api/workflows/register-and-activate', account)}
                   onRefreshAccessToken={refreshAccountAccessToken}
                   onDelete={deleteAccount}
@@ -707,8 +707,7 @@ function App() {
             busy={busy}
             onSessionSave={(account, sessionToken) => updateAccountAuth(account, { session_token: sessionToken })}
             onAccessSave={(account, accessToken) => updateAccountAuth(account, { access_token: accessToken })}
-            onProbePlusTrial={(account) => runAccountWorkflow('资格探测', '/api/workflows/probe-plus-trial', account)}
-            onProbeTier={(account) => runAccountWorkflow('Tier 探测', '/api/workflows/probe-tier', account)}
+            onProbeAccount={(account) => runAccountWorkflow('探测账号', '/api/workflows/probe', account)}
             onLogin={(account) => runAccountWorkflow(loginActionLabel(account), '/api/workflows/login', account)}
             onRefreshAccessToken={refreshAccountAccessToken}
             refreshingAccessToken={refreshingAccessTokenIds.has(selectedAccount.account_id)}
@@ -839,15 +838,14 @@ function DetailDrawer({ open, title, onClose, children }: {
   );
 }
 
-function AccountDetails({ account, showSecrets, busy, refreshingAccessToken, onSessionSave, onAccessSave, onProbePlusTrial, onProbeTier, onLogin, onRefreshAccessToken }: {
+function AccountDetails({ account, showSecrets, busy, refreshingAccessToken, onSessionSave, onAccessSave, onProbeAccount, onLogin, onRefreshAccessToken }: {
   account: Account;
   showSecrets: boolean;
   busy: boolean;
   refreshingAccessToken: boolean;
   onSessionSave: (account: Account, sessionToken: string) => Promise<void>;
   onAccessSave: (account: Account, accessToken: string) => Promise<void>;
-  onProbePlusTrial: (account: Account) => void;
-  onProbeTier: (account: Account) => void;
+  onProbeAccount: (account: Account) => void;
   onLogin: (account: Account) => void;
   onRefreshAccessToken: (account: Account) => Promise<void>;
 }) {
@@ -867,11 +865,8 @@ function AccountDetails({ account, showSecrets, busy, refreshingAccessToken, onS
                 <KeyRound size={14} /> {loginActionLabel(account)}
               </Button>
             )}
-            <Button {...buttonHint('用 Session 探测当前账号 Tier')} disabled={busy || !canProbeTier(account)} onClick={() => onProbeTier(account)}>
-              <Search size={14} /> 探测 Tier
-            </Button>
-            <Button {...buttonHint('用 Session 探测当前账号 Plus 状态')} disabled={busy || !canProbePlusTrial(account)} onClick={() => onProbePlusTrial(account)}>
-              <Search size={14} /> 探测资格
+            <Button {...buttonHint(probeAccountHint(account))} disabled={busy || !canProbeAccount(account)} onClick={() => onProbeAccount(account)}>
+              <Search size={14} /> 探测账号
             </Button>
           </div>
         </div>
@@ -984,7 +979,7 @@ function OtpSubmitter({ job, onSubmit }: {
   );
 }
 
-function AccountTable({ accounts, selected, showSecrets, runningAccountIds, refreshingAccessTokenIds, busy, onSelect, onRegister, onLogin, onActivate, onProbePlusTrial, onProbeTier, onRegisterActivate, onRefreshAccessToken, onDelete }: {
+function AccountTable({ accounts, selected, showSecrets, runningAccountIds, refreshingAccessTokenIds, busy, onSelect, onRegister, onLogin, onActivate, onProbeAccount, onRegisterActivate, onRefreshAccessToken, onDelete }: {
   accounts: Account[];
   selected?: string;
   showSecrets: boolean;
@@ -995,8 +990,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, refr
   onRegister: (a: Account) => void;
   onLogin: (a: Account) => void;
   onActivate: (a: Account) => void;
-  onProbePlusTrial: (a: Account) => void;
-  onProbeTier: (a: Account) => void;
+  onProbeAccount: (a: Account) => void;
   onRegisterActivate: (a: Account) => void;
   onRefreshAccessToken: (a: Account) => Promise<void>;
   onDelete: (a: Account) => void;
@@ -1048,8 +1042,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, refr
                     onRegister={onRegister}
                     onLogin={onLogin}
                     onActivate={onActivate}
-                    onProbePlusTrial={onProbePlusTrial}
-                    onProbeTier={onProbeTier}
+                    onProbeAccount={onProbeAccount}
                     onRegisterActivate={onRegisterActivate}
                     onRefreshAccessToken={onRefreshAccessToken}
                     onDelete={onDelete}
@@ -1064,7 +1057,7 @@ function AccountTable({ accounts, selected, showSecrets, runningAccountIds, refr
   );
 }
 
-function AccountRowActions({ account, accountBusy, busy, refreshingAccessToken, onRegister, onLogin, onActivate, onProbePlusTrial, onProbeTier, onRegisterActivate, onRefreshAccessToken, onDelete }: {
+function AccountRowActions({ account, accountBusy, busy, refreshingAccessToken, onRegister, onLogin, onActivate, onProbeAccount, onRegisterActivate, onRefreshAccessToken, onDelete }: {
   account: Account;
   accountBusy: boolean;
   busy: boolean;
@@ -1072,21 +1065,19 @@ function AccountRowActions({ account, accountBusy, busy, refreshingAccessToken, 
   onRegister: (a: Account) => void;
   onLogin: (a: Account) => void;
   onActivate: (a: Account) => void;
-  onProbePlusTrial: (a: Account) => void;
-  onProbeTier: (a: Account) => void;
+  onProbeAccount: (a: Account) => void;
   onRegisterActivate: (a: Account) => void;
   onRefreshAccessToken: (a: Account) => Promise<void>;
   onDelete: (a: Account) => void;
 }) {
-  if (accountBusy) return <span className="busyLabel">进行中</span>;
+  if (accountBusy && !isUserAlreadyExistsAccount(account)) return <span className="busyLabel">进行中</span>;
 
   const actions: RowActionDescriptor[] = [];
   if (canRegister(account)) actions.push({ label: '注册账号', icon: <Play size={14} />, onClick: () => onRegister(account), disabled: busy, kind: 'primary' });
   if (canActivate(account)) actions.push({ label: '激活支付', icon: <Zap size={14} />, onClick: () => onActivate(account), disabled: busy, kind: actions.length ? 'secondary' : 'primary' });
   if (canRefreshAccessToken(account)) actions.push({ label: refreshingAccessToken ? '获取中' : '获取 Access', icon: <KeyRound size={14} />, onClick: () => void onRefreshAccessToken(account), disabled: busy || refreshingAccessToken, kind: actions.length ? 'secondary' : 'primary' });
   if (canLoginSession(account)) actions.push({ label: loginActionLabel(account), icon: <KeyRound size={14} />, onClick: () => onLogin(account), disabled: busy, kind: actions.length ? 'secondary' : 'primary' });
-  if (canProbeTier(account)) actions.push({ label: '探测 Tier', icon: <Search size={14} />, onClick: () => onProbeTier(account), disabled: busy, kind: 'secondary' });
-  if (canProbePlusTrial(account)) actions.push({ label: '探测资格', icon: <Search size={14} />, onClick: () => onProbePlusTrial(account), disabled: busy, kind: 'secondary' });
+  if (canProbeAccount(account)) actions.push({ label: '探测账号', icon: <Search size={14} />, onClick: () => onProbeAccount(account), disabled: busy, kind: 'secondary' });
   if (canRegister(account)) actions.push({ label: '注册并激活', icon: <ShieldCheck size={14} />, onClick: () => onRegisterActivate(account), disabled: busy, kind: 'secondary' });
   actions.push({ label: '删除账号', icon: <Trash2 size={14} />, onClick: () => onDelete(account), disabled: busy, kind: 'danger' });
 
@@ -1766,31 +1757,35 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function canRegister(account: Account) {
-  return account.status !== 'EMAIL_ALREADY_EXISTS' && !hasRegisteredSession(account);
+  return !isUserAlreadyExistsAccount(account) && !hasRegisteredSession(account);
 }
 
 function canActivate(account: Account) {
-  return account.status !== 'ACTIVATED' &&
+  return !isUserAlreadyExistsAccount(account) &&
+    account.status !== 'ACTIVATED' &&
     !account.plus_active &&
     normalizeTier(account.tier) === 'free' &&
     account.plus_trial_eligible === true &&
     (!!account.session_token || !!account.access_token);
 }
 
-function canProbeTier(account: Account) {
-  return !!account.session_token;
+function canProbeAccount(account: Account) {
+  return !isUserAlreadyExistsAccount(account) && !!account.session_token;
 }
 
-function canProbePlusTrial(account: Account) {
-  return !!account.session_token;
+function probeAccountHint(account: Account) {
+  if (account.plus_trial_eligible !== undefined && account.plus_trial_eligible !== null) {
+    return '资格已探测，直接探测 Tier';
+  }
+  return '先探测 Plus 资格，再探测 Tier';
 }
 
 function canRefreshAccessToken(account: Account) {
-  return !!account.session_token && !account.access_token;
+  return !isUserAlreadyExistsAccount(account) && !!account.session_token && !account.access_token;
 }
 
 function canLoginSession(account: Account) {
-  return !!account.email && !!account.password;
+  return !isUserAlreadyExistsAccount(account) && !!account.email && !!account.password;
 }
 
 function loginActionLabel(account: Account) {
@@ -1813,6 +1808,10 @@ function hasRegisteredSession(account: Account) {
   return account.status === 'REGISTERED' || account.status === 'ACTIVATED' || !!account.session_token || !!account.access_token;
 }
 
+function isUserAlreadyExistsAccount(account: Account) {
+  return account.status === 'USER_ALREADY_EXISTS' || account.status === 'EMAIL_ALREADY_EXISTS';
+}
+
 function canRetryJob(job: Job) {
   return job.retryable && job.status.startsWith('FAILED');
 }
@@ -1823,7 +1822,7 @@ function canSubmitOtp(job: Job) {
 
 function otpSubmitLabel(job: Job) {
   if (job.action === 'LOGIN_SESSION') return '登录 OTP';
-  if (job.action === 'ACTIVATE' || (job.action === 'REGISTER_AND_ACTIVATE' && job.last_step === 'gopay_payment')) {
+  if (job.action === 'ACTIVATE' || (job.action === 'REGISTER_AND_ACTIVATE' && (job.last_step === 'gopay_login' || job.last_step === 'gopay_payment'))) {
     return '支付 OTP';
   }
   return '注册 OTP';

@@ -9,5 +9,8 @@
     "browser_locale": "zh-CN",
     "pin_locale": "id"
   },
-  "proxy": ""
+  "proxies": {
+    "checkout": "",
+    "payment": ""
+  }
 }

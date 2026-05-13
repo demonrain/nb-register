@@ -2,8 +2,9 @@
 """GoPay tokenization payment flow for ChatGPT Plus subscriptions.
 
 Replays Stripe → Midtrans → GoPay's tokenization linking + charge in pure
-HTTP. No browser needed. GoPay OTP is delivered via an injected callback
-(stdin for CLI, file-watch runner, gRPC, HTTP, or the service webhook).
+HTTP. No browser needed. GoPay OTP is delivered by the caller through an
+injected callback; the service API uses segmented start/complete calls instead
+of waiting for OTP inside this module.
 
 Flow (15 steps):
 
@@ -35,18 +36,19 @@ from __future__ import annotations
 
 import argparse
 import base64
-import datetime as _dt
+import http.server
 import json
 import os
 import re
-import shlex
-import subprocess
+import socketserver
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -63,6 +65,32 @@ def _new_session(impersonate: str = "chrome136") -> Any:
     if _CurlCffiSession is not None:
         return _CurlCffiSession(impersonate=impersonate)
     return requests.Session()
+
+
+def _clean_proxy(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _set_session_proxy(session: Any, proxy: Optional[str]) -> None:
+    try:
+        value = _clean_proxy(proxy)
+        session.proxies = {"http": value, "https": value} if value else {}
+    except Exception:
+        pass
+
+
+def _cfg_proxy(cfg: dict, *keys: str) -> str:
+    for key in keys:
+        value: Any = cfg
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                value = ""
+                break
+            value = value.get(part)
+        cleaned = _clean_proxy(value)
+        if cleaned:
+            return cleaned
+    return ""
 
 
 _SESSION_PAID_BOOL_KEYS = {
@@ -404,11 +432,7 @@ def probe_tier_access_token(
 
     session = _new_session()
     try:
-        if proxy:
-            try:
-                session.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
+        _set_session_proxy(session, proxy)
         session.headers.update({
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -489,11 +513,7 @@ def probe_plus_active_session_token(
 
     session = _new_session()
     try:
-        if proxy:
-            try:
-                session.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
+        _set_session_proxy(session, proxy)
         session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -575,6 +595,8 @@ DEFAULT_STRIPE_PK = (
     "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRac"
     "ViovU3kLKvpkjh7IqkW00iXQsjo3n"
 )
+DEFAULT_STRIPE_HCAPTCHA_ASSET_VERSION = "v32.5"
+HCAPTCHA_SITE_KEY_FALLBACK = "c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a"
 
 GOPAY_PIN_CLIENT_ID_LINK = "51b5f09a-3813-11ee-be56-0242ac120002-MGUPA"
 GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
@@ -591,7 +613,6 @@ LINK_BYPASS_BODY_HINTS = (
     "rate limit",
     "rate_limit",
 )
-DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 MIDTRANS_STATUS_POLL_LIMIT = 12
 RETRYABLE_TRANSPORT_HINTS = (
     "tls connect error",
@@ -666,6 +687,27 @@ def _extract_reference_from_text(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def _extract_checkout_session_id(data: dict[str, Any]) -> str:
+    for key in ("checkout_session_id", "session_id", "id"):
+        value = str(data.get(key) or "").strip()
+        if value.startswith("cs_"):
+            return value
+    for key in ("url", "stripe_hosted_url", "checkout_url"):
+        text = str(data.get(key) or "")
+        match = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _checkout_url_from_response(data: dict[str, Any], cs_id: str) -> str:
+    for key in ("url", "stripe_hosted_url", "checkout_url"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return f"https://checkout.stripe.com/c/pay/{cs_id}" if cs_id else ""
+
+
 def _extract_midtrans_charge_reference(data: Any) -> str:
     for _, text in _iter_json_strings(data):
         reference = _extract_reference_from_text(text)
@@ -727,6 +769,384 @@ def _request_with_retries(
     raise last_exc or GoPayError(f"{method.upper()} {host} failed")
 
 
+def _build_stripe_hcaptcha_url(
+    invisible: bool = True,
+    frame_id: str = "",
+    origin: str = "https://js.stripe.com",
+) -> str:
+    frame = frame_id or str(uuid.uuid4())
+    page_name = "HCaptchaInvisible.html" if invisible else "HCaptcha.html"
+    return (
+        "https://b.stripecdn.com/stripethirdparty-srv/assets/"
+        f"{DEFAULT_STRIPE_HCAPTCHA_ASSET_VERSION}/{page_name}"
+        f"?id={frame}&origin={quote(origin, safe='')}"
+    )
+
+
+def _extract_passive_captcha_config(init_data: dict) -> dict:
+    raw = json.dumps(init_data or {}, separators=(",", ":"))
+    passive = init_data.get("passive_captcha") if isinstance(init_data.get("passive_captcha"), dict) else {}
+    site_key = passive.get("site_key") or init_data.get("site_key") or ""
+    rqdata = passive.get("rqdata")
+    if rqdata is None:
+        rqdata = init_data.get("rqdata", "")
+
+    if not site_key:
+        match = re.search(r'"hcaptcha_site_key"\s*:\s*"([^"]+)"', raw)
+        if match:
+            site_key = match.group(1)
+    if not rqdata:
+        match = re.search(r'"hcaptcha_rqdata"\s*:\s*"([^"]+)"', raw)
+        if match:
+            rqdata = match.group(1)
+
+    return {
+        "site_key": site_key or HCAPTCHA_SITE_KEY_FALLBACK,
+        "rqdata": rqdata or "",
+        "is_invisible": True,
+        "website_url": _build_stripe_hcaptcha_url(invisible=True),
+    }
+
+
+def _accept_language_for_locale(locale_value: str | None) -> str:
+    locale = (locale_value or "").strip().lower()
+    if locale.startswith("zh"):
+        return "zh-CN,zh;q=0.9,en;q=0.8"
+    if locale.startswith("id"):
+        return "id-ID,id;q=0.9,en;q=0.8"
+    return "en-US,en;q=0.9"
+
+
+def _playwright_proxy(proxy_url: str) -> Optional[dict]:
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return None
+    try:
+        parsed = urlparse(proxy_url)
+        host = parsed.hostname or ""
+        if not host:
+            return None
+        server = f"{parsed.scheme or 'http'}://{host}"
+        if parsed.port:
+            server += f":{parsed.port}"
+        proxy = {"server": server, "bypass": "127.0.0.1,localhost"}
+        if parsed.username:
+            proxy["username"] = parsed.username
+        if parsed.password:
+            proxy["password"] = parsed.password
+        return proxy
+    except Exception:
+        return None
+
+
+def _build_stripe_hcaptcha_parent_html(
+    frame_id: str,
+    wrapper_url: str,
+    site_key: str,
+    rqdata: str,
+    merchant_id: str,
+    locale: str,
+) -> str:
+    init_payload = {
+        "tag": "INITIALIZE_HCAPTCHA_INVISIBLE",
+        "message": {"sitekey": site_key},
+    }
+    execute_payload = {
+        "tag": "EXECUTE_HCAPTCHA_INVISIBLE",
+        "message": {
+            "sitekey": site_key,
+            "rqdata": rqdata,
+            "data": {
+                "merchant_id": merchant_id or "",
+                "locale": locale or "",
+                "flow": "passive_captcha",
+                "captcha_vendor": "hcaptcha",
+            },
+        },
+    }
+    signal_payloads = [
+        {
+            "tag": "SEND_FRAUD_SIGNALS_HCAPTCHA_INVISIBLE",
+            "message": {"type": "mouse", "eventName": "mousemove", "coordinates": {"x": 168, "y": 132}},
+        },
+        {
+            "tag": "SEND_FRAUD_SIGNALS_HCAPTCHA_INVISIBLE",
+            "message": {"type": "pointer", "eventName": "pointermove", "coordinates": {"x": 214, "y": 176}},
+        },
+        {
+            "tag": "SEND_FRAUD_SIGNALS_HCAPTCHA_INVISIBLE",
+            "message": {"type": "keyboard", "eventName": "keydown"},
+        },
+    ]
+    return f"""<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Stripe hCaptcha Bridge</title></head>
+  <body>
+    <iframe id="stripeCaptchaFrame" src="{wrapper_url}" style="width:420px;height:720px;border:0"></iframe>
+    <script>
+      const frameID = {json.dumps(frame_id)};
+      const initPayload = {json.dumps(init_payload, ensure_ascii=False)};
+      const executePayload = {json.dumps(execute_payload, ensure_ascii=False)};
+      const signalPayloads = {json.dumps(signal_payloads, ensure_ascii=False)};
+      let initialized = false;
+      let executed = false;
+
+      function postToBridge(path, payload) {{
+        fetch(path, {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify(payload || {{}}),
+          keepalive: true,
+        }}).catch(() => {{}});
+      }}
+
+      function postToChild(source, origin, payload) {{
+        source.postMessage({{
+          type: "stripe-third-party-parent-to-child",
+          frameID,
+          payload,
+        }}, origin);
+      }}
+
+      function initialize(source, origin) {{
+        if (initialized) return;
+        initialized = true;
+        postToBridge("/event", {{type: "invisible_initialize"}});
+        postToChild(source, origin, initPayload);
+      }}
+
+      function execute(source, origin) {{
+        if (executed) return;
+        executed = true;
+        signalPayloads.forEach((payload, idx) => setTimeout(() => postToChild(source, origin, payload), 50 * idx));
+        setTimeout(() => {{
+          postToBridge("/event", {{type: "invisible_execute"}});
+          postToChild(source, origin, executePayload);
+        }}, 180);
+      }}
+
+      window.addEventListener("message", (event) => {{
+        const data = event.data || {{}};
+        if (data.type === "stripe-third-party-frame-ready" && data.frameID === frameID) {{
+          postToBridge("/event", {{type: "frame_ready", origin: event.origin}});
+          initialize(event.source, event.origin);
+          return;
+        }}
+        if (data.type !== "stripe-third-party-child-to-parent" || data.frameID !== frameID) return;
+        const payload = data.payload || {{}};
+        postToBridge("/event", {{type: "child_payload", tag: payload.tag || ""}});
+        if (payload.tag === "LOAD_HCAPTCHA_INVISIBLE") {{
+          execute(event.source, event.origin);
+          return;
+        }}
+        if (payload.tag === "RESPONSE_HCAPTCHA_INVISIBLE") {{
+          const value = payload.value || {{}};
+          postToBridge("/result", {{
+            response: value.response || "",
+            ekey: value.key || "",
+            duration: value.duration || 0,
+            raw: payload,
+          }});
+          return;
+        }}
+        if (payload.tag === "ERROR_HCAPTCHA_INVISIBLE") {{
+          postToBridge("/error", {{error: (payload.value || {{}}).error || "unknown_error", raw: payload}});
+        }}
+      }});
+    </script>
+  </body>
+</html>
+"""
+
+
+def _solve_passive_hcaptcha_in_browser(
+    hcaptcha_config: dict,
+    *,
+    browser_cfg: dict,
+    merchant_id: str,
+    locale: str,
+    log: Callable[[str], None] = print,
+) -> tuple[str, str]:
+    if not bool((browser_cfg or {}).get("enabled", True)):
+        raise GoPayError("approve blocked and browser_challenge is disabled")
+    if not bool((browser_cfg or {}).get("use_for_passive_captcha", True)):
+        raise GoPayError("approve blocked and browser_challenge.use_for_passive_captcha is disabled")
+
+    timeout_ms = int(
+        (browser_cfg or {}).get("passive_timeout_ms")
+        or (browser_cfg or {}).get("timeout_ms")
+        or 120000
+    )
+    headless = bool((browser_cfg or {}).get("passive_headless", True))
+    viewport = (browser_cfg or {}).get("viewport") or {"width": 1280, "height": 960}
+    proxy_url = str(
+        (browser_cfg or {}).get("passive_proxy_url")
+        or (browser_cfg or {}).get("proxy_url")
+        or ""
+    ).strip()
+    site_key = hcaptcha_config["site_key"]
+    rqdata = hcaptcha_config.get("rqdata", "")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise GoPayError(f"approve blocked and browser_challenge requires playwright: {exc}") from exc
+
+    with tempfile.TemporaryDirectory(prefix="stripe-hcaptcha-bridge-") as tmpdir:
+        bridge_state = {"events": [], "result": None, "error": None}
+        result_event = threading.Event()
+        error_event = threading.Event()
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=tmpdir, **kwargs)
+
+            def log_message(self, fmt, *args):
+                return
+
+            def _write_json(self, status: int, payload: dict):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                raw_body = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                except Exception:
+                    payload = {}
+                if self.path == "/event":
+                    bridge_state["events"].append(payload)
+                    self._write_json(200, {"ok": True})
+                    return
+                if self.path == "/result":
+                    bridge_state["result"] = payload
+                    result_event.set()
+                    self._write_json(200, {"ok": True})
+                    return
+                if self.path == "/error":
+                    bridge_state["error"] = payload
+                    error_event.set()
+                    self._write_json(200, {"ok": True})
+                    return
+                self._write_json(404, {"error": "not found"})
+
+        class BridgeServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        httpd = BridgeServer(("127.0.0.1", 0), QuietHandler)
+        port = httpd.server_address[1]
+        origin = f"http://127.0.0.1:{port}"
+        frame_id = str(uuid.uuid4())
+        wrapper_url = _build_stripe_hcaptcha_url(invisible=True, frame_id=frame_id, origin=origin)
+        html = _build_stripe_hcaptcha_parent_html(
+            frame_id=frame_id,
+            wrapper_url=wrapper_url,
+            site_key=site_key,
+            rqdata=rqdata,
+            merchant_id=merchant_id,
+            locale=locale,
+        )
+        with open(os.path.join(tmpdir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+
+        playwright_ctx = None
+        browser = None
+        page = None
+        try:
+            log(
+                "[gopay] browser passive hCaptcha "
+                f"site_key={site_key[:12]} rqdata={'yes' if rqdata else 'no'} headless={headless}"
+            )
+            playwright_ctx = sync_playwright().start()
+            launch_kwargs = {
+                "headless": headless,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            }
+            chromium_executable = str(
+                (browser_cfg or {}).get("chromium_executable")
+                or os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+                or ""
+            ).strip()
+            if chromium_executable:
+                launch_kwargs["executable_path"] = chromium_executable
+            proxy = _playwright_proxy(proxy_url)
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            browser = playwright_ctx.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                viewport=viewport,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+                ),
+                locale=locale or "en-US",
+                timezone_id=str((browser_cfg or {}).get("timezone") or "America/Chicago"),
+                extra_http_headers={"Accept-Language": _accept_language_for_locale(locale)},
+            )
+            page = context.new_page()
+            page.goto(f"{origin}/index.html", wait_until="domcontentloaded", timeout=60000)
+
+            deadline = time.time() + timeout_ms / 1000
+            logged_events = 0
+            while time.time() < deadline:
+                events = bridge_state["events"]
+                while logged_events < len(events):
+                    event = events[logged_events]
+                    logged_events += 1
+                    event_type = event.get("type") or "event"
+                    tag = event.get("tag") or ""
+                    if tag:
+                        log(f"[gopay] Stripe invisible payload: {tag}")
+                    elif event_type in ("frame_ready", "invisible_initialize", "invisible_execute"):
+                        log(f"[gopay] Stripe invisible event: {event_type}")
+                if result_event.wait(timeout=1):
+                    result = bridge_state.get("result") or {}
+                    token = str(result.get("response") or "")
+                    ekey = str(result.get("ekey") or "")
+                    if token:
+                        log(f"[gopay] browser passive hCaptcha solved token_len={len(token)} ekey_len={len(ekey)}")
+                        return token, ekey
+                    raise GoPayError("approve blocked and browser passive hCaptcha returned empty token")
+                if error_event.is_set():
+                    err = bridge_state.get("error") or {}
+                    raise GoPayError(f"approve blocked and browser passive hCaptcha failed: {str(err)[:240]}")
+            raise GoPayError(f"approve blocked and browser passive hCaptcha timeout ({timeout_ms // 1000}s)")
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright_ctx is not None:
+                try:
+                    playwright_ctx.stop()
+                except Exception:
+                    pass
+            httpd.shutdown()
+            httpd.server_close()
+
+
+def _is_approve_blocked_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "approve" in text and "blocked" in text
+
+
 # ──────────────────────────── core ────────────────────────────────
 
 
@@ -748,10 +1168,16 @@ class GoPayCharger:
         gopay_cfg: dict,
         otp_provider: Callable[[], str],
         log: Callable[[str], None] = print,
-        proxy: Optional[str] = None,
+        checkout_proxy: Optional[str] = None,
+        payment_proxy: Optional[str] = None,
         runtime_cfg: Optional[dict] = None,
+        checkout_cfg: Optional[dict] = None,
+        browser_challenge_cfg: Optional[dict] = None,
+        pre_solve_passive_captcha: bool = False,
     ):
         self.cs = chatgpt_session
+        self.checkout_proxy = _clean_proxy(checkout_proxy)
+        self.payment_proxy = _clean_proxy(payment_proxy)
         self.country_code = str(gopay_cfg["country_code"]).lstrip("+")
         self.phone = re.sub(r"\D", "", str(gopay_cfg["phone_number"]))
         self.pin = str(gopay_cfg["pin"])
@@ -768,6 +1194,9 @@ class GoPayCharger:
         # are computed by Stripe.js client-side; replay the captured values from
         # config.runtime or HAR. Without them confirm 400.
         self.runtime = runtime_cfg or {}
+        self.checkout_cfg = checkout_cfg or {}
+        self.browser_challenge_cfg = browser_challenge_cfg or {}
+        self.pre_solve_passive_captcha = bool(pre_solve_passive_captcha)
         # separate session for non-chatgpt domains (avoid leaking chatgpt cookies)
         self.ext = _new_session()
         self.ext.headers.update({
@@ -782,15 +1211,9 @@ class GoPayCharger:
                 else "en-US,en;q=0.9"
             ),
         })
-        if proxy:
-            try:
-                self.cs.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
-            try:
-                self.ext.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
+        _set_session_proxy(self.cs, self.payment_proxy)
+        _set_session_proxy(self.ext, self.payment_proxy)
+        self.checkout_url = ""
 
     def close(self) -> None:
         for sess in (self.cs, self.ext):
@@ -801,8 +1224,9 @@ class GoPayCharger:
                 except Exception:
                     pass
 
-    def _chatgpt_request(self, method: str, url: str, **kwargs: Any) -> Any:
+    def _chatgpt_request(self, method: str, url: str, *, proxy: Optional[str] = None, **kwargs: Any) -> Any:
         log = getattr(self, "log", None)
+        _set_session_proxy(self.cs, self.payment_proxy if proxy is None else proxy)
         return _request_with_retries(
             self.cs,
             method,
@@ -813,6 +1237,7 @@ class GoPayCharger:
 
     def _ext_request(self, method: str, url: str, **kwargs: Any) -> Any:
         log = getattr(self, "log", None)
+        _set_session_proxy(self.ext, self.payment_proxy)
         return _request_with_retries(
             self.ext,
             method,
@@ -824,32 +1249,36 @@ class GoPayCharger:
     # ───── Step 1-4: ChatGPT/Stripe checkout ─────
 
     def _chatgpt_create_checkout(self) -> str:
+        plan = self.checkout_cfg
+        promo_campaign_id = str(plan.get("promo_campaign_id") or "plus-1-month-free").strip()
         body = {
-            "entry_point": "all_plans_pricing_modal",
-            "plan_name": "chatgptplusplan",
-            "billing_details": {"country": "ID", "currency": "IDR"},
-            "promo_campaign": {
-                "promo_campaign_id": "plus-1-month-free",
-                "is_coupon_from_query_param": False,
+            "plan_name": str(plan.get("plan_name") or "chatgptplusplan"),
+            "billing_details": {
+                "country": str(plan.get("billing_country") or "ID"),
+                "currency": str(plan.get("billing_currency") or "IDR"),
             },
-            "checkout_ui_mode": "hosted",
-            "cancel_url": "https://chatgpt.com/#pricing",
+            "checkout_ui_mode": str(plan.get("checkout_ui_mode") or "hosted"),
         }
+        cancel_url = str(plan.get("cancel_url") or "https://chatgpt.com/#pricing").strip()
+        if cancel_url:
+            body["cancel_url"] = cancel_url
+        if promo_campaign_id:
+            body["promo_campaign"] = {
+                "promo_campaign_id": promo_campaign_id,
+                "is_coupon_from_query_param": False,
+            }
         r = self._chatgpt_request(
             "post",
             "https://chatgpt.com/backend-api/payments/checkout",
-            json=body, timeout=DEFAULT_TIMEOUT,
+            json=body, timeout=DEFAULT_TIMEOUT, proxy=self.checkout_proxy,
         )
         r.raise_for_status()
         data = r.json()
-        cs_id = (
-            data.get("checkout_session_id")
-            or data.get("session_id")
-            or data.get("id")
-        )
+        cs_id = _extract_checkout_session_id(data)
         if not cs_id or not str(cs_id).startswith("cs_"):
             raise GoPayError(f"checkout create: bad response {data!r}")
-        self.log(f"[gopay] checkout created cs={cs_id}")
+        self.checkout_url = _checkout_url_from_response(data, cs_id)
+        self.log(f"[gopay] checkout created cs={cs_id} hosted_url={'yes' if self.checkout_url else 'no'}")
         return cs_id
 
     def _stripe_create_pm(self, cs_id: str, stripe_pk: str, billing: dict) -> str:
@@ -931,7 +1360,34 @@ class GoPayCharger:
                 return ((action.get("redirect_to_url") or {}).get("url") or "").strip()
         return ""
 
-    def _stripe_confirm(self, cs_id: str, pm_id: str, stripe_pk: str) -> dict:
+    def _solve_passive_confirm_captcha(self, init_data: dict) -> tuple[str, str]:
+        captcha = _extract_passive_captcha_config(init_data)
+        self.log(
+            "[gopay] passive captcha "
+            f"site_key={captcha['site_key'][:12]} rqdata={'yes' if captcha.get('rqdata') else 'no'}"
+        )
+        browser_cfg = dict(self.browser_challenge_cfg or {})
+        payment_proxy = getattr(self, "payment_proxy", "")
+        if payment_proxy and not (browser_cfg.get("passive_proxy_url") or browser_cfg.get("proxy_url")):
+            browser_cfg["passive_proxy_url"] = payment_proxy
+        return _solve_passive_hcaptcha_in_browser(
+            captcha,
+            browser_cfg=browser_cfg,
+            merchant_id=self._midtrans_merchant_id or "",
+            locale=self.browser_locale,
+            log=self.log,
+        )
+
+    def _stripe_confirm(
+        self,
+        cs_id: str,
+        pm_id: str,
+        stripe_pk: str,
+        *,
+        force_passive_captcha: bool = False,
+        captcha_token: str = "",
+        captcha_ekey: str = "",
+    ) -> dict:
         init_data = self._stripe_init(cs_id, stripe_pk)
         init_checksum = init_data.get("init_checksum", "")
         expected_amount, expected_amount_source = _resolve_expected_amount(
@@ -972,6 +1428,12 @@ class GoPayCharger:
             "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
             "key": stripe_pk,
         }
+        if force_passive_captcha and not captcha_token:
+            captcha_token, captcha_ekey = self._solve_passive_confirm_captcha(init_data)
+        if captcha_token:
+            body["passive_captcha_token"] = captcha_token
+        if captcha_ekey:
+            body["passive_captcha_ekey"] = captcha_ekey
         # Stripe runtime anti-bot tokens (replayable per-session-only; without
         # these confirm fails for hCaptcha-protected merchants like OpenAI).
         if self.runtime.get("js_checksum"):
@@ -1034,6 +1496,10 @@ class GoPayCharger:
             "post",
             "https://chatgpt.com/backend-api/payments/checkout/approve",
             json={"checkout_session_id": cs_id, "processor_entity": processor_entity},
+            headers={
+                "x-openai-target-path": "/backend-api/payments/checkout/approve",
+                "x-openai-target-route": "/backend-api/payments/checkout/approve",
+            },
             timeout=DEFAULT_TIMEOUT,
         )
         r.raise_for_status()
@@ -1617,14 +2083,38 @@ class GoPayCharger:
         billing = billing or {}
         cs_id = self._chatgpt_create_checkout()
         pm_id = self._stripe_create_pm(cs_id, stripe_pk, billing)
-        confirm_data = self._stripe_confirm(cs_id, pm_id, stripe_pk)
+        confirm_data = self._stripe_confirm(
+            cs_id,
+            pm_id,
+            stripe_pk,
+            force_passive_captcha=self.pre_solve_passive_captcha,
+        )
         redirect_url = self._extract_redirect_to_url(confirm_data)
         if redirect_url:
             self.log("[gopay] confirm returned redirect directly")
             snap_token = self._fetch_pm_redirect_snap_token(redirect_url)
         else:
-            self._chatgpt_approve(cs_id)
-            snap_token = self._follow_redirect_to_midtrans(cs_id, stripe_pk)
+            try:
+                self._chatgpt_approve(cs_id)
+                snap_token = self._follow_redirect_to_midtrans(cs_id, stripe_pk)
+            except GoPayError as exc:
+                if not _is_approve_blocked_error(exc):
+                    raise
+                self.log("[gopay] chatgpt approve blocked; retrying confirm with passive hCaptcha")
+                pm_id = self._stripe_create_pm(cs_id, stripe_pk, billing)
+                confirm_data = self._stripe_confirm(
+                    cs_id,
+                    pm_id,
+                    stripe_pk,
+                    force_passive_captcha=True,
+                )
+                redirect_url = self._extract_redirect_to_url(confirm_data)
+                if redirect_url:
+                    self.log("[gopay] captcha confirm returned redirect directly")
+                    snap_token = self._fetch_pm_redirect_snap_token(redirect_url)
+                else:
+                    self._chatgpt_approve(cs_id)
+                    snap_token = self._follow_redirect_to_midtrans(cs_id, stripe_pk)
         self.log(f"[gopay] midtrans snap_token={snap_token}")
         return self.start_linking_until_otp(snap_token, cs_id, stripe_pk)
 
@@ -1637,7 +2127,7 @@ class GoPayCharger:
         self._gopay_validate_reference(reference_id)
         issued_after_unix = int(time.time())
         self._gopay_user_consent(reference_id)
-        self._gopay_resend_otp(reference_id)
+        # self._gopay_resend_otp(reference_id)
         return {
             "cs_id": cs_id,
             "stripe_pk": stripe_pk,
@@ -1728,6 +2218,7 @@ def file_watch_otp_provider(watch_path: Path, timeout: float = 300.0) -> Callabl
 
 
 _CHECKOUT_AMOUNT_KEYS = (
+    "due",
     "amount_total",
     "amount_due",
     "total_amount",
@@ -1807,13 +2298,14 @@ def _select_checkout_amount(init_data: dict) -> tuple[Optional[int], str]:
         return None, "unknown"
 
     preferred_keys = (
+        "due",
         "amount_total",
         "amount_due",
         "total_amount",
         "amount_remaining",
         "total",
     )
-    preferred_contexts = ("checkout", "session", "invoice", "subscription")
+    preferred_contexts = ("total_summary", "checkout", "session", "invoice", "subscription")
     for key in preferred_keys:
         for source, amount in candidates:
             parts = tuple(source.lower().split("."))
@@ -1829,6 +2321,7 @@ def probe_plus_trial_checkout(
     *,
     stripe_pk: str = DEFAULT_STRIPE_PK,
     runtime_cfg: Optional[dict] = None,
+    checkout_cfg: Optional[dict] = None,
     proxy: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> dict:
@@ -1837,8 +2330,10 @@ def probe_plus_trial_checkout(
         chatgpt_session,
         {"country_code": "0", "phone_number": "0", "pin": "0"},
         otp_provider=lambda: (_ for _ in ()).throw(OTPCancelled("OTP not used by probe")),
-        proxy=proxy,
+        checkout_proxy=proxy,
+        payment_proxy=proxy,
         runtime_cfg=runtime_cfg,
+        checkout_cfg=checkout_cfg,
         log=log,
     )
     try:
@@ -1846,7 +2341,7 @@ def probe_plus_trial_checkout(
             cs_id = charger._chatgpt_create_checkout()
         except Exception as exc:
             raise GoPayError(f"checkout create failed: {str(exc)[:500]}") from exc
-        checkout_url = f"https://checkout.stripe.com/c/pay/{cs_id}"
+        checkout_url = charger.checkout_url or f"https://checkout.stripe.com/c/pay/{cs_id}"
         try:
             init_data = charger._stripe_init(cs_id, stripe_pk)
         except Exception as exc:
@@ -1932,465 +2427,6 @@ def _stripe_confirm_error_detail(
     )
 
 
-def _clean_otp_candidate(value: Any) -> str:
-    code = re.sub(r"\D", "", str(value or ""))
-    if 4 <= len(code) <= 8:
-        return code
-    return ""
-
-
-def _extract_otp_from_text(text: str, code_regex: str = DEFAULT_OTP_REGEX) -> str:
-    """Extract the most likely WhatsApp OTP from a text blob.
-
-    Keyword-aware patterns run before the generic regex to avoid confusing
-    amounts / phone numbers with OTPs in verbose WhatsApp messages.
-    """
-    if not text:
-        return ""
-    patterns = [
-        r"(?:otp|one[-\s]*time|verification|verify|code|kode|verifikasi|gopay|whatsapp|验证码|驗證碼)[^\d]{0,80}(\d{4,8})(?!\d)",
-        r"(?<!\d)(\d{4,8})(?!\d)[^\n\r]{0,80}(?:otp|one[-\s]*time|verification|verify|code|kode|verifikasi|gopay|验证码|驗證碼)",
-        code_regex or DEFAULT_OTP_REGEX,
-    ]
-    for pattern in patterns:
-        try:
-            matches = list(re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL))
-        except re.error:
-            continue
-        for match in reversed(matches):
-            groups = match.groups() or (match.group(0),)
-            for group in reversed(groups):
-                code = _clean_otp_candidate(group)
-                if code:
-                    return code
-    return ""
-
-
-def _json_path_get(obj: Any, path: str) -> Any:
-    cur = obj
-    for part in (path or "").split("."):
-        part = part.strip()
-        if not part:
-            continue
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        elif isinstance(cur, list) and part.isdigit():
-            idx = int(part)
-            if idx >= len(cur):
-                return None
-            cur = cur[idx]
-        else:
-            return None
-    return cur
-
-
-def _parse_payload_timestamp(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        if ts > 1_000_000_000_000:  # milliseconds
-            ts /= 1000.0
-        if 946684800 <= ts <= 4102444800:  # 2000-01-01 .. 2100-01-01
-            return ts
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d{10,13}", text):
-        return _parse_payload_timestamp(float(text))
-    try:
-        return _dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-
-def _dict_timestamp(obj: dict) -> Optional[float]:
-    for key in ("ts", "timestamp", "time", "created_at", "received_at", "date"):
-        if key in obj:
-            ts = _parse_payload_timestamp(obj.get(key))
-            if ts is not None:
-                return ts
-    return None
-
-
-def _iter_json_message_candidates(obj: Any) -> Any:
-    """Yield (text, timestamp) candidates from generic relay / Meta webhook JSON."""
-    if isinstance(obj, dict):
-        ts = _dict_timestamp(obj)
-        pieces: list[str] = []
-        for key in ("otp", "code", "body", "message", "text", "content", "caption", "raw"):
-            if key not in obj:
-                continue
-            value = obj.get(key)
-            if isinstance(value, dict):
-                body = value.get("body") or value.get("text") or value.get("message")
-                if body not in (None, ""):
-                    pieces.append(str(body))
-            elif isinstance(value, (str, int, float)):
-                pieces.append(str(value))
-        if pieces:
-            yield " ".join(pieces), ts
-        for value in obj.values():
-            yield from _iter_json_message_candidates(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from _iter_json_message_candidates(item)
-    elif isinstance(obj, str):
-        yield obj, None
-
-
-def _extract_otp_from_payload(
-    payload: Any,
-    *,
-    code_regex: str = DEFAULT_OTP_REGEX,
-    json_path: str = "",
-    issued_after: float = 0.0,
-) -> str:
-    if isinstance(payload, str):
-        stripped = payload.strip()
-        if stripped[:1] in ("{", "["):
-            try:
-                payload = json.loads(stripped)
-            except Exception:
-                return _extract_otp_from_text(payload, code_regex=code_regex)
-        else:
-            return _extract_otp_from_text(payload, code_regex=code_regex)
-
-    if json_path:
-        target = _json_path_get(payload, json_path)
-        if target is None:
-            return ""
-        if not isinstance(target, str):
-            target = json.dumps(target, ensure_ascii=False)
-        return _extract_otp_from_text(target, code_regex=code_regex)
-
-    found = ""
-    for text, ts in _iter_json_message_candidates(payload):
-        if issued_after and ts is not None and ts < issued_after:
-            continue
-        code = _extract_otp_from_text(text, code_regex=code_regex)
-        if code:
-            found = code
-    return found
-
-
-def _float_cfg(cfg: dict, key: str, default: float) -> float:
-    try:
-        return float(cfg.get(key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _headers_cfg(raw: Any) -> dict:
-    return raw if isinstance(raw, dict) else {}
-
-
-def whatsapp_file_otp_provider(
-    path: Path,
-    *,
-    timeout: float = 300.0,
-    interval: float = 1.0,
-    code_regex: str = DEFAULT_OTP_REGEX,
-    json_path: str = "",
-    issued_after_slack_s: float = 15.0,
-    delete_after_read: bool = False,
-    log: Callable[[str], None] = print,
-) -> Callable[[], str]:
-    """Poll a local WhatsApp relay state/log file and extract a fresh OTP."""
-
-    def provider() -> str:
-        issued_after = time.time() - max(0.0, issued_after_slack_s)
-        deadline = time.time() + timeout
-        last_error = ""
-        log(f"[gopay] waiting WhatsApp OTP from file: {path}")
-        while time.time() < deadline:
-            try:
-                if path.exists():
-                    stat = path.stat()
-                    if stat.st_mtime >= issued_after:
-                        text = path.read_text(encoding="utf-8", errors="replace")
-                        code = _extract_otp_from_payload(
-                            text,
-                            code_regex=code_regex,
-                            json_path=json_path,
-                            issued_after=issued_after,
-                        )
-                        if code:
-                            if delete_after_read:
-                                try:
-                                    path.unlink()
-                                except FileNotFoundError:
-                                    pass
-                            return code
-                last_error = ""
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(max(0.2, interval))
-        detail = f"; last_error={last_error}" if last_error else ""
-        raise OTPCancelled(f"OTP timeout after {timeout}s (file={path}{detail})")
-
-    return provider
-
-
-def whatsapp_http_otp_provider(
-    url: str,
-    *,
-    timeout: float = 300.0,
-    interval: float = 1.0,
-    headers: Optional[dict] = None,
-    params: Optional[dict] = None,
-    code_regex: str = DEFAULT_OTP_REGEX,
-    json_path: str = "",
-    issued_after_slack_s: float = 15.0,
-    log: Callable[[str], None] = print,
-) -> Callable[[], str]:
-    """Poll a local/owned WhatsApp relay HTTP endpoint for the latest OTP.
-
-    The endpoint may return plain text or JSON. JSON can either expose the code
-    directly (for example {"otp":"123456"}) or contain a WhatsApp Cloud API-like
-    message payload; timestamps are honored when present.
-    """
-
-    def provider() -> str:
-        issued_after = time.time() - max(0.0, issued_after_slack_s)
-        deadline = time.time() + timeout
-        sess = requests.Session()
-        base_params = dict(params or {})
-        last_error = ""
-        log(f"[gopay] waiting WhatsApp OTP from relay: {url}")
-        while time.time() < deadline:
-            try:
-                req_params = dict(base_params)
-                if "since" not in req_params:
-                    req_params["since"] = str(int(issued_after))
-                resp = sess.get(
-                    url,
-                    headers=headers or {},
-                    params=req_params,
-                    timeout=min(10.0, max(2.0, interval + 1.0)),
-                )
-                if resp.status_code in (204, 404):
-                    time.sleep(max(0.2, interval))
-                    continue
-                resp.raise_for_status()
-                try:
-                    payload: Any = resp.json()
-                except ValueError:
-                    payload = resp.text
-                code = _extract_otp_from_payload(
-                    payload,
-                    code_regex=code_regex,
-                    json_path=json_path,
-                    issued_after=issued_after,
-                )
-                if code:
-                    return code
-                last_error = ""
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(max(0.2, interval))
-        detail = f"; last_error={last_error}" if last_error else ""
-        raise OTPCancelled(f"OTP timeout after {timeout}s (url={url}{detail})")
-
-    return provider
-
-
-def command_otp_provider(
-    command: Any,
-    *,
-    timeout: float = 300.0,
-    interval: float = 2.0,
-    code_regex: str = DEFAULT_OTP_REGEX,
-    log: Callable[[str], None] = print,
-) -> Callable[[], str]:
-    """Poll a user-owned command that prints the latest WhatsApp OTP."""
-    argv = command if isinstance(command, list) else shlex.split(str(command or ""))
-    if not argv:
-        raise GoPayError("gopay.otp.command is empty")
-
-    def provider() -> str:
-        deadline = time.time() + timeout
-        last_error = ""
-        log(f"[gopay] waiting WhatsApp OTP from command: {argv[0]}")
-        while time.time() < deadline:
-            try:
-                proc = subprocess.run(
-                    argv,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=min(20.0, max(2.0, interval + 1.0)),
-                    check=False,
-                )
-                text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-                code = _extract_otp_from_text(text, code_regex=code_regex)
-                if code:
-                    return code
-                if proc.returncode not in (0, 1):
-                    last_error = f"exit={proc.returncode}: {text.strip()[:160]}"
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(max(0.2, interval))
-        detail = f"; last_error={last_error}" if last_error else ""
-        raise OTPCancelled(f"OTP timeout after {timeout}s (command{detail})")
-
-    return provider
-
-
-def grpc_otp_provider(
-    addr: str,
-    *,
-    timeout: float = 150.0,
-    attempts: int = 2,
-    purpose: str = "gopay",
-    issued_after_slack_s: float = 15.0,
-    log: Callable[[str], None] = print,
-) -> Callable[[], str]:
-    """Wait for WhatsApp OTP through OtpService gRPC."""
-    if not addr:
-        raise GoPayError("gopay.otp source=grpc requires addr")
-    attempts = max(1, int(attempts))
-
-    def provider() -> str:
-        import grpc
-        import otp_pb2
-        import otp_pb2_grpc
-
-        issued_after = int(time.time() - max(0.0, issued_after_slack_s))
-        last_error = ""
-        for attempt in range(1, attempts + 1):
-            log(f"[gopay] waiting WhatsApp OTP via gRPC {addr} attempt={attempt}/{attempts}")
-            try:
-                with grpc.insecure_channel(addr) as channel:
-                    stub = otp_pb2_grpc.OtpServiceStub(channel)
-                    resp = stub.WaitForOtp(
-                        otp_pb2.WaitForOtpRequest(
-                            purpose=purpose,
-                            timeout_seconds=int(timeout),
-                            issued_after_unix=issued_after,
-                        ),
-                        timeout=float(timeout) + 10.0,
-                    )
-                if resp.found and resp.otp:
-                    return str(resp.otp).strip()
-                last_error = resp.error_message or "not found"
-            except Exception as exc:
-                last_error = str(exc)
-            if attempt < attempts:
-                log(f"[gopay] OTP not received; retrying ({last_error[:120]})")
-        raise OTPCancelled(f"OTP not received after {attempts} gRPC waits; last_error={last_error}")
-
-    return provider
-
-
-def build_configured_otp_provider(
-    gopay_cfg: dict,
-    *,
-    fallback_provider: Callable[[], str] = cli_otp_provider,
-    log: Callable[[str], None] = print,
-) -> Callable[[], str]:
-    """Build OTP provider from gopay.otp config, falling back to manual input.
-
-    Supported config:
-      "gopay": {
-        "otp": {
-          "source": "grpc" | "http" | "file" | "command" | "manual" | "auto",
-          "url": "http://127.0.0.1:8765/api/whatsapp/latest-otp?token=...",
-          "addr": "127.0.0.1:50056",
-          "command": ["python", "scripts/get_wa_otp.py"],
-          "timeout": 300,
-          "interval": 1,
-          "code_regex": "(?<!\\d)(\\d{6})(?!\\d)",
-          "issued_after_slack_s": 15
-        }
-      }
-    """
-    otp_cfg = gopay_cfg.get("otp") or gopay_cfg.get("otp_provider") or {}
-    if not isinstance(otp_cfg, dict) or not otp_cfg:
-        return fallback_provider
-
-    source = str(otp_cfg.get("source") or otp_cfg.get("type") or "auto").strip().lower()
-    if source in ("", "manual", "cli", "stdin"):
-        return fallback_provider
-
-    timeout = _float_cfg(otp_cfg, "timeout", _float_cfg(otp_cfg, "timeout_s", 300.0))
-    interval = _float_cfg(otp_cfg, "interval", _float_cfg(otp_cfg, "poll_interval_s", 1.0))
-    code_regex = str(otp_cfg.get("code_regex") or DEFAULT_OTP_REGEX)
-    json_path = str(otp_cfg.get("json_path") or "")
-    slack = _float_cfg(otp_cfg, "issued_after_slack_s", 15.0)
-    attempts = int(_float_cfg(otp_cfg, "attempts", 2.0))
-    purpose = str(otp_cfg.get("purpose") or "gopay")
-
-    env_url = os.getenv("WEBUI_GOPAY_OTP_URL", "").strip()
-    env_grpc_addr = os.getenv("WEBUI_GOPAY_OTP_GRPC_ADDR", "").strip()
-    grpc_addr = str(otp_cfg.get("addr") or otp_cfg.get("grpc_addr") or env_grpc_addr or "").strip()
-    url = str(otp_cfg.get("url") or otp_cfg.get("relay_url") or env_url or "").strip()
-    path = str(
-        otp_cfg.get("path")
-        or otp_cfg.get("state_file")
-        or otp_cfg.get("log_file")
-        or ""
-    ).strip()
-    command = otp_cfg.get("command") or otp_cfg.get("cmd")
-
-    if grpc_addr and source in ("auto", "grpc", "whatsapp_grpc", "wa_grpc"):
-        return grpc_otp_provider(
-            grpc_addr,
-            timeout=timeout,
-            attempts=attempts,
-            purpose=purpose,
-            issued_after_slack_s=slack,
-            log=log,
-        )
-    if source in ("grpc", "whatsapp_grpc", "wa_grpc"):
-        raise GoPayError("gopay.otp source=grpc requires addr/grpc_addr")
-
-    if url and (source in ("auto", "http", "https", "relay", "whatsapp_http", "wa_http") or env_url):
-        return whatsapp_http_otp_provider(
-            url,
-            timeout=timeout,
-            interval=interval,
-            headers=_headers_cfg(otp_cfg.get("headers")),
-            params=otp_cfg.get("params") if isinstance(otp_cfg.get("params"), dict) else None,
-            code_regex=code_regex,
-            json_path=json_path,
-            issued_after_slack_s=slack,
-            log=log,
-        )
-
-    if source in ("auto", "file", "state_file", "log", "whatsapp_file", "wa_file"):
-        if path:
-            return whatsapp_file_otp_provider(
-                Path(path).expanduser(),
-                timeout=timeout,
-                interval=interval,
-                code_regex=code_regex,
-                json_path=json_path,
-                issued_after_slack_s=slack,
-                delete_after_read=bool(otp_cfg.get("delete_after_read", False)),
-                log=log,
-            )
-        if source != "auto":
-            raise GoPayError("gopay.otp source=file requires path/state_file/log_file")
-
-    if source in ("auto", "command", "cmd"):
-        if command:
-            return command_otp_provider(
-                command,
-                timeout=timeout,
-                interval=interval,
-                code_regex=code_regex,
-                log=log,
-            )
-        if source != "auto":
-            raise GoPayError("gopay.otp source=command requires command")
-
-    if source == "auto":
-        return fallback_provider
-    raise GoPayError(f"unsupported gopay.otp source: {source}")
-
-
 # ──────────────────────────── chatgpt session ─────────────────────
 
 
@@ -2406,6 +2442,7 @@ def _build_chatgpt_session(auth_cfg: dict, proxy: Optional[str] = None) -> Any:
     access_token = (auth_cfg.get("access_token") or "").strip()
     cookie_header = (auth_cfg.get("cookie_header") or "").strip()
     device_id = (auth_cfg.get("device_id") or "").strip() or str(uuid.uuid4())
+    sentinel_token = (auth_cfg.get("openai_sentinel_token") or "").strip()
     user_agent = auth_cfg.get("user_agent") or (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -2440,6 +2477,8 @@ def _build_chatgpt_session(auth_cfg: dict, proxy: Optional[str] = None) -> Any:
     })
     if access_token:
         s.headers["Authorization"] = f"Bearer {access_token}"
+    if sentinel_token:
+        s.headers["openai-sentinel-token"] = sentinel_token
 
     parts = []
     seen = set()
@@ -2495,11 +2534,18 @@ def _load_cfg(path: str) -> dict:
         return json.load(f)
 
 
-def resolve_proxy(cfg: dict) -> Optional[str]:
+def resolve_checkout_proxy(cfg: dict) -> Optional[str]:
     return (
-        (os.environ.get("GOPAY_PROXY_URL") or "").strip()
-        or (os.environ.get("PROXY_URL") or "").strip()
-        or (cfg.get("proxy") or "").strip()
+        _clean_proxy(os.environ.get("GOPAY_CHECKOUT_PROXY_URL"))
+        or _cfg_proxy(cfg, "proxies.checkout", "checkout_proxy")
+        or None
+    )
+
+
+def resolve_payment_proxy(cfg: dict) -> Optional[str]:
+    return (
+        _clean_proxy(os.environ.get("GOPAY_PAYMENT_PROXY_URL"))
+        or _cfg_proxy(cfg, "proxies.payment", "payment_proxy")
         or None
     )
 
@@ -2564,10 +2610,10 @@ def main():
         auth_cfg["session_token"] = session_token
         auth_cfg.pop("cookie_header", None)
         auth_cfg.pop("access_token", None)
-    # Apply proxy to both chatgpt + external sessions.
-    proxy_value = resolve_proxy(cfg)
+    checkout_proxy = resolve_checkout_proxy(cfg)
+    payment_proxy = resolve_payment_proxy(cfg)
     try:
-        cs_session = _build_chatgpt_session(auth_cfg, proxy=proxy_value)
+        cs_session = _build_chatgpt_session(auth_cfg, proxy=checkout_proxy)
     except GoPayError as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(2)
@@ -2591,12 +2637,17 @@ def main():
     if args.otp_file:
         provider = file_watch_otp_provider(Path(args.otp_file), timeout=args.otp_timeout)
     else:
-        provider = build_configured_otp_provider(gopay_cfg, fallback_provider=cli_otp_provider)
+        provider = cli_otp_provider
 
     charger = GoPayCharger(
         cs_session, gopay_cfg,
-        otp_provider=provider, proxy=proxy_value,
+        otp_provider=provider,
+        checkout_proxy=checkout_proxy,
+        payment_proxy=payment_proxy,
         runtime_cfg=cfg.get("runtime"),
+        checkout_cfg=dict((cfg.get("fresh_checkout") or {}).get("plan") or {}),
+        browser_challenge_cfg=dict(cfg.get("browser_challenge") or {}),
+        pre_solve_passive_captcha=bool(cfg.get("pre_solve_passive_captcha", False)),
     )
     try:
         if args.from_redirect_url:

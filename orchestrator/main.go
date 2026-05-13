@@ -27,8 +27,7 @@ import (
 const (
 	actionRegister            = "REGISTER"
 	actionActivate            = "ACTIVATE"
-	actionProbePlusTrial      = "PROBE_PLUS_TRIAL"
-	actionProbeTier           = "PROBE_TIER"
+	actionProbeAccount        = "PROBE_ACCOUNT"
 	actionLoginSession        = "LOGIN_SESSION"
 	actionRegisterAndActivate = "REGISTER_AND_ACTIVATE"
 	actionRegisterMailbox     = "REGISTER_MAILBOX"
@@ -41,9 +40,9 @@ const (
 	statusFailedRetryable   = "FAILED_RETRYABLE"
 	statusFailedFinal       = "FAILED_FINAL"
 
-	accountStatusRegistered         = "REGISTERED"
-	accountStatusActivated          = "ACTIVATED"
-	accountStatusEmailAlreadyExists = "EMAIL_ALREADY_EXISTS"
+	accountStatusRegistered        = "REGISTERED"
+	accountStatusActivated         = "ACTIVATED"
+	accountStatusUserAlreadyExists = "USER_ALREADY_EXISTS"
 
 	emailStatusAvailable         = "AVAILABLE"
 	emailStatusRegistered        = "REGISTERED"
@@ -59,6 +58,7 @@ const (
 	emailAuthStatusNeedsManualVerify = "NEEDS_MANUAL_VERIFICATION"
 
 	stepRegisterAccount = "register_account"
+	stepEnsureLogon     = "ensure_logon"
 	stepGoPayPayment    = "gopay_payment"
 	stepProbePlusTrial  = "probe_plus_trial"
 	stepProbeTier       = "probe_tier"
@@ -74,17 +74,25 @@ const (
 
 type orchestratorServer struct {
 	pb.UnimplementedOrchestratorServiceServer
-	db                    *gorm.DB
-	accountClient         pb.AccountDatabaseServiceClient
-	browserClient         pb.BrowserRegistrationClient
-	paymentClient         pb.PaymentServiceClient
-	emailClient           pb.EmailServiceClient
-	mailboxRegisterClient pb.MailboxRegistrationServiceClient
-	otpAddr               string
-	otpTimeout            int32
-	regOTPTimeout         int32
-	temporal              temporalclient.Client
-	taskQueue             string
+	db                                *gorm.DB
+	accountClient                     pb.AccountDatabaseServiceClient
+	browserClient                     pb.BrowserRegistrationClient
+	paymentClient                     pb.PaymentServiceClient
+	cycleClient                       pb.GopayCycleServiceClient
+	smsClient                         pb.SMSServiceClient
+	emailClient                       pb.EmailServiceClient
+	mailboxRegisterClient             pb.MailboxRegistrationServiceClient
+	otpAddr                           string
+	otpTimeout                        int32
+	regOTPTimeout                     int32
+	changePhoneMaxFailures            int
+	changePhoneOTPWaitSeconds         int32
+	changePhoneOTPRetryAttempts       int
+	changePhoneGetNumberRetryDelay    time.Duration
+	changePhoneSMSCancelTimeout       time.Duration
+	changePhoneSMSCancelRetryInterval time.Duration
+	temporal                          temporalclient.Client
+	taskQueue                         string
 }
 
 type registrationOTPResult struct {
@@ -175,12 +183,15 @@ func (s *orchestratorServer) setJobParams(ctx context.Context, jobID string, par
 
 func (s *orchestratorServer) getJobParam(ctx context.Context, jobID, key string) (string, bool, error) {
 	var param db.JobParam
-	err := s.db.WithContext(ctx).First(&param, "job_id = ? AND key = ?", jobID, key).Error
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return "", false, nil
-		}
-		return "", false, err
+	result := s.db.WithContext(ctx).
+		Where("job_id = ? AND key = ?", jobID, key).
+		Limit(1).
+		Find(&param)
+	if result.Error != nil {
+		return "", false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return "", false, nil
 	}
 	return param.Value, true, nil
 }
@@ -529,7 +540,7 @@ func (s *orchestratorServer) waitForRegistrationOtp(ctx context.Context, jobID, 
 			}
 			emailCh = nil
 		case <-ticker.C:
-			code, found, err := s.consumeManualRegistrationOtp(ctx, jobID)
+			code, found, err := s.consumeManualRegistrationOtp(ctx, jobID, issuedAfterUnix)
 			if err != nil {
 				lastErr = err
 				continue
@@ -548,10 +559,13 @@ func (s *orchestratorServer) waitForRegistrationOtp(ctx context.Context, jobID, 
 	}
 }
 
-func (s *orchestratorServer) consumeManualRegistrationOtp(ctx context.Context, jobID string) (string, bool, error) {
+func (s *orchestratorServer) consumeManualRegistrationOtp(ctx context.Context, jobID string, issuedAfterUnix int64) (string, bool, error) {
 	value, found, err := s.getJobParam(ctx, jobID, registrationOTPParam)
 	if err != nil || !found {
 		return "", false, err
+	}
+	if !manualOTPSubmittedAfter(ctx, s, jobID, registrationOTPParam, registrationOTPSubmittedAtParam, issuedAfterUnix) {
+		return "", false, nil
 	}
 	code := normalizeOTP(value)
 	if code == "" {
@@ -564,27 +578,47 @@ func (s *orchestratorServer) consumeManualRegistrationOtp(ctx context.Context, j
 	return code, true, nil
 }
 
-func (s *orchestratorServer) pay(ctx context.Context, jobID string, account *pb.Account, sessionToken, accessToken string) (result *pb.GoPayResponse, data map[string]any, err error) {
+func (s *orchestratorServer) pay(ctx context.Context, jobID string, account *pb.Account, sessionToken, accessToken string, useCycleToken bool) (result *pb.GoPayResponse, data map[string]any, err error) {
 	if sessionToken == "" {
 		sessionToken = account.GetSessionToken()
 	}
 	if accessToken == "" {
 		accessToken = account.GetAccessToken()
 	}
+
 	data = map[string]any{
 		"account_id":             account.GetAccountId(),
 		"session_token_present":  sessionToken != "",
 		"access_token_present":   accessToken != "",
+		"used_cycle_token":       useCycleToken,
 		"otp_value_recorded":     false,
 		"payment_result_present": false,
 	}
-	if sessionToken == "" && accessToken == "" {
+	if !useCycleToken && sessionToken == "" && accessToken == "" {
 		return nil, data, fmt.Errorf("session_token or access_token is required")
+	}
+	if useCycleToken {
+		data["cycle_balance_check"] = map[string]any{
+			"required_before_payment": true,
+		}
+		if err := s.waitForCycleMinBalance(ctx); err != nil {
+			data["cycle_balance_check"] = map[string]any{
+				"required_before_payment": true,
+				"ready":                   false,
+				"error_message":           err.Error(),
+			}
+			return nil, data, err
+		}
+		data["cycle_balance_check"] = map[string]any{
+			"required_before_payment": true,
+			"ready":                   true,
+		}
 	}
 
 	started, err := s.paymentClient.StartGoPay(ctx, &pb.StartGoPayRequest{
-		SessionToken: sessionToken,
-		AccessToken:  accessToken,
+		SessionToken:  sessionToken,
+		AccessToken:   accessToken,
+		UseCycleToken: useCycleToken,
 	})
 	data["payment_start"] = paymentStartData(started)
 	if err != nil {
@@ -634,13 +668,14 @@ func (s *orchestratorServer) pay(ctx context.Context, jobID string, account *pb.
 		return nil, data, fmt.Errorf("payment complete failed: %s", result.GetErrorMessage())
 	}
 	completed = true
+
 	return result, data, nil
 }
 
 func (s *orchestratorServer) waitForPaymentOtp(ctx context.Context, jobID string, issuedAfterUnix int64) (paymentOTPResult, error) {
 	addr := s.otpAddr
 	if addr == "" {
-		addr = "gopay-payment:50051"
+		addr = "whatsapp-otp-relay:50051"
 	}
 	timeoutSeconds := s.paymentOtpTimeout()
 	defer func() {
@@ -705,7 +740,7 @@ func (s *orchestratorServer) waitForPaymentOtp(ctx context.Context, jobID string
 			}
 			otpCh = nil
 		case <-ticker.C:
-			code, found, err := s.consumeManualPaymentOtp(ctx, jobID)
+			code, found, err := s.consumeManualPaymentOtp(ctx, jobID, issuedAfterUnix)
 			if err != nil {
 				lastErr = err
 				continue
@@ -724,10 +759,13 @@ func (s *orchestratorServer) waitForPaymentOtp(ctx context.Context, jobID string
 	}
 }
 
-func (s *orchestratorServer) consumeManualPaymentOtp(ctx context.Context, jobID string) (string, bool, error) {
+func (s *orchestratorServer) consumeManualPaymentOtp(ctx context.Context, jobID string, issuedAfterUnix int64) (string, bool, error) {
 	value, found, err := s.getJobParam(ctx, jobID, paymentOTPParam)
 	if err != nil || !found {
 		return "", false, err
+	}
+	if !manualOTPSubmittedAfter(ctx, s, jobID, paymentOTPParam, paymentOTPSubmittedAtParam, issuedAfterUnix) {
+		return "", false, nil
 	}
 	code := normalizeOTP(value)
 	if code == "" {
@@ -738,6 +776,30 @@ func (s *orchestratorServer) consumeManualPaymentOtp(ctx context.Context, jobID 
 	}
 	_ = s.deleteJobParam(ctx, jobID, paymentOTPSubmittedAtParam)
 	return code, true, nil
+}
+
+type jobParamStore interface {
+	getJobParam(context.Context, string, string) (string, bool, error)
+	deleteJobParam(context.Context, string, string) error
+}
+
+func manualOTPSubmittedAfter(ctx context.Context, store jobParamStore, jobID, otpParam, submittedAtParam string, issuedAfterUnix int64) bool {
+	if issuedAfterUnix <= 0 {
+		return true
+	}
+	submittedAtValue, found, err := store.getJobParam(ctx, jobID, submittedAtParam)
+	if err != nil || !found {
+		_ = store.deleteJobParam(ctx, jobID, otpParam)
+		_ = store.deleteJobParam(ctx, jobID, submittedAtParam)
+		return false
+	}
+	submittedAt, err := strconv.ParseInt(strings.TrimSpace(submittedAtValue), 10, 64)
+	if err != nil || submittedAt < issuedAfterUnix {
+		_ = store.deleteJobParam(ctx, jobID, otpParam)
+		_ = store.deleteJobParam(ctx, jobID, submittedAtParam)
+		return false
+	}
+	return true
 }
 
 func (s *orchestratorServer) RegisterAccount(ctx context.Context, req *pb.RegisterAccountRequest) (*pb.RegisterAccountResponse, error) {
@@ -812,36 +874,20 @@ func (s *orchestratorServer) LoginAccount(ctx context.Context, req *pb.LoginAcco
 	return &pb.LoginAccountResponse{JobId: jobID, Started: true}, nil
 }
 
-func (s *orchestratorServer) ProbePlusTrial(ctx context.Context, req *pb.ProbePlusTrialRequest) (*pb.ProbePlusTrialResponse, error) {
+func (s *orchestratorServer) ProbeAccount(ctx context.Context, req *pb.ProbeAccountRequest) (*pb.ProbeAccountResponse, error) {
 	accountID := strings.TrimSpace(req.GetAccountId())
 	if accountID == "" {
-		return &pb.ProbePlusTrialResponse{ErrorMessage: "account_id is required"}, nil
+		return &pb.ProbeAccountResponse{ErrorMessage: "account_id is required"}, nil
 	}
 	jobID := uuid.NewString()
-	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("probe-plus-trial-"+jobID), ProbePlusTrialWorkflow, ProbePlusTrialWorkflowInput{
+	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("probe-"+jobID), ProbeAccountWorkflow, ProbeAccountWorkflowInput{
 		JobID:     jobID,
 		AccountID: accountID,
 	})
 	if err != nil {
-		return &pb.ProbePlusTrialResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
+		return &pb.ProbeAccountResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
 	}
-	return &pb.ProbePlusTrialResponse{JobId: jobID, Started: true}, nil
-}
-
-func (s *orchestratorServer) ProbeTier(ctx context.Context, req *pb.ProbeTierRequest) (*pb.ProbeTierResponse, error) {
-	accountID := strings.TrimSpace(req.GetAccountId())
-	if accountID == "" {
-		return &pb.ProbeTierResponse{ErrorMessage: "account_id is required"}, nil
-	}
-	jobID := uuid.NewString()
-	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions("probe-tier-"+jobID), ProbeTierWorkflow, ProbeTierWorkflowInput{
-		JobID:     jobID,
-		AccountID: accountID,
-	})
-	if err != nil {
-		return &pb.ProbeTierResponse{JobId: jobID, ErrorMessage: err.Error()}, nil
-	}
-	return &pb.ProbeTierResponse{JobId: jobID, Started: true}, nil
+	return &pb.ProbeAccountResponse{JobId: jobID, Started: true}, nil
 }
 
 func (s *orchestratorServer) RegisterAndActivateAccount(ctx context.Context, req *pb.RegisterAndActivateAccountRequest) (*pb.RegisterAndActivateAccountResponse, error) {
@@ -1018,7 +1064,7 @@ func manualOTPParamsForJobSnapshot(job *db.Job) (string, string, string, error) 
 	case actionActivate:
 		return paymentOTPParam, paymentOTPSubmittedAtParam, "payment", nil
 	case actionRegisterAndActivate:
-		if job.LastStep == stepGoPayPayment {
+		if job.LastStep == stepEnsureLogon || job.LastStep == stepGoPayPayment {
 			return paymentOTPParam, paymentOTPSubmittedAtParam, "payment", nil
 		}
 		return registrationOTPParam, registrationOTPSubmittedAtParam, "registration", nil
@@ -1258,6 +1304,20 @@ func main() {
 	}
 	defer paymentConn.Close()
 
+	cycleAddr := envDefault("GOPAY_CYCLE_ADDR", "gopay-cycle:50051")
+	cycleConn, err := grpc.NewClient(cycleAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to gopay-cycle service: %v", err)
+	}
+	defer cycleConn.Close()
+
+	smsAddr := envDefault("SMS_SERVICE_ADDR", "sms-service:50051")
+	smsConn, err := grpc.NewClient(smsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to sms-service: %v", err)
+	}
+	defer smsConn.Close()
+
 	accountDBAddr := envDefault("ACCOUNT_DB_ADDR", "account-db:50051")
 	accountDBConn, err := grpc.NewClient(accountDBAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -1293,17 +1353,25 @@ func main() {
 	}
 
 	server := &orchestratorServer{
-		db:                    db.InitDB(),
-		accountClient:         pb.NewAccountDatabaseServiceClient(accountDBConn),
-		browserClient:         pb.NewBrowserRegistrationClient(browserConn),
-		paymentClient:         pb.NewPaymentServiceClient(paymentConn),
-		emailClient:           pb.NewEmailServiceClient(emailConn),
-		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(mailboxRegisterConn),
-		otpAddr:               envDefault("GOPAY_OTP_SERVICE_ADDR", envDefault("OTP_ADDR", "gopay-payment:50051")),
-		otpTimeout:            envInt32("GOPAY_OTP_TIMEOUT_SECONDS", 60),
-		regOTPTimeout:         envInt32("REGISTRATION_OTP_TIMEOUT_SECONDS", 180),
-		temporal:              temporalClient,
-		taskQueue:             envDefault("TEMPORAL_TASK_QUEUE", taskQueueDefault),
+		db:                                db.InitDB(),
+		accountClient:                     pb.NewAccountDatabaseServiceClient(accountDBConn),
+		browserClient:                     pb.NewBrowserRegistrationClient(browserConn),
+		paymentClient:                     pb.NewPaymentServiceClient(paymentConn),
+		cycleClient:                       pb.NewGopayCycleServiceClient(cycleConn),
+		smsClient:                         pb.NewSMSServiceClient(smsConn),
+		emailClient:                       pb.NewEmailServiceClient(emailConn),
+		mailboxRegisterClient:             pb.NewMailboxRegistrationServiceClient(mailboxRegisterConn),
+		otpAddr:                           envDefault("GOPAY_OTP_SERVICE_ADDR", envDefault("OTP_ADDR", "whatsapp-otp-relay:50051")),
+		otpTimeout:                        envInt32("GOPAY_OTP_TIMEOUT_SECONDS", 60),
+		regOTPTimeout:                     envInt32("REGISTRATION_OTP_TIMEOUT_SECONDS", 180),
+		changePhoneMaxFailures:            envInt("GOPAY_CHANGE_PHONE_MAX_FAILURES", defaultChangePhoneMaxFailures),
+		changePhoneOTPWaitSeconds:         envInt32("GOPAY_CHANGE_PHONE_OTP_WAIT_SECONDS", defaultChangePhoneOTPWaitSeconds),
+		changePhoneOTPRetryAttempts:       envIntNonNegative("GOPAY_CHANGE_PHONE_OTP_RETRY_ATTEMPTS", defaultChangePhoneOTPRetryAttempts),
+		changePhoneGetNumberRetryDelay:    envNonNegativeDurationSeconds("GOPAY_CHANGE_PHONE_GET_NUMBER_RETRY_SECONDS", defaultChangePhoneGetNumberRetryDelay),
+		changePhoneSMSCancelTimeout:       envPositiveDurationSeconds("GOPAY_CHANGE_PHONE_SMS_CANCEL_TIMEOUT_SECONDS", defaultChangePhoneSMSCancelTimeout),
+		changePhoneSMSCancelRetryInterval: envPositiveDurationSeconds("GOPAY_CHANGE_PHONE_SMS_CANCEL_RETRY_SECONDS", defaultChangePhoneSMSCancelRetryInterval),
+		temporal:                          temporalClient,
+		taskQueue:                         envDefault("TEMPORAL_TASK_QUEUE", taskQueueDefault),
 	}
 
 	temporalWorker := temporalworker.New(temporalClient, server.taskQueue, temporalworker.Options{})
@@ -1388,6 +1456,40 @@ func envInt32(key string, fallback int32) int32 {
 		return fallback
 	}
 	return int32(n)
+}
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func envIntNonNegative(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+func envPositiveDurationSeconds(key string, fallback time.Duration) time.Duration {
+	seconds := envInt(key, int(fallback/time.Second))
+	return time.Duration(seconds) * time.Second
+}
+
+func envNonNegativeDurationSeconds(key string, fallback time.Duration) time.Duration {
+	seconds := envIntNonNegative(key, int(fallback/time.Second))
+	return time.Duration(seconds) * time.Second
 }
 
 func envBool(key string, fallback bool) bool {

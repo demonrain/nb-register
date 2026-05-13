@@ -3,8 +3,10 @@ FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE=/usr/bin/chromium
 
 WORKDIR /app
 
@@ -20,19 +22,20 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         /etc/apt/sources.list; \
     fi \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates chromium \
     && rm -rf /var/lib/apt/lists/*
 
-COPY gopay-flow/requirements.txt /tmp/requirements.txt
+COPY gopay-payment/gopay-flow/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY gopay-flow/ /app/gopay-flow/
-COPY NOTICE LICENSE run_gopay.sh run_payment_server.sh /app/
+COPY gopay-payment/gopay-flow/ /app/gopay-flow/
+COPY proto/gopay_cycle.proto /app/proto/gopay_cycle.proto
+COPY gopay-payment/NOTICE gopay-payment/LICENSE gopay-payment/run_gopay.sh gopay-payment/run_payment_server.sh /app/
 
 WORKDIR /app/gopay-flow
-RUN python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. proto/payment.proto proto/otp.proto
+RUN python -m grpc_tools.protoc -I proto -I /app/proto --python_out=. --grpc_python_out=. proto/payment.proto /app/proto/gopay_cycle.proto
 
-EXPOSE 50051 8081
+EXPOSE 50051
 
 ENTRYPOINT ["python", "payment_server.py"]
 CMD ["--config", "config.json", "--listen", ":50051"]

@@ -25,12 +25,28 @@ gen_go account-db
 gen_go orchestrator
 gen_go dashboard
 gen_go outlook-imap-service
+gen_go whatsapp-otp-relay
 
 gen_py browser-reg "${ROOT}/browser-reg/proto/browser.proto"
 gen_py outlook-register-service "${ROOT}/outlook-register-service/proto/mailbox_register.proto"
 
-python3 -m grpc_tools.protoc -I "${ROOT}/gopay-payment/gopay-flow/proto" \
+python3 -m grpc_tools.protoc \
+  -I "${ROOT}/gopay-payment/gopay-flow/proto" \
+  -I "${ROOT}/proto" \
   --python_out="${ROOT}/gopay-payment/gopay-flow" \
   --grpc_python_out="${ROOT}/gopay-payment/gopay-flow" \
   "${ROOT}/gopay-payment/gopay-flow/proto/payment.proto" \
-  "${ROOT}/gopay-payment/gopay-flow/proto/otp.proto"
+  "${ROOT}/proto/gopay_cycle.proto"
+
+python3 -m grpc_tools.protoc \
+  -I "${ROOT}/proto" \
+  --python_out="${ROOT}/gopay-cycle" \
+  --grpc_python_out="${ROOT}/gopay-cycle" \
+  "${ROOT}/proto/gopay_cycle.proto" \
+  "${ROOT}/proto/sms.proto"
+
+python3 -m grpc_tools.protoc \
+  -I "${ROOT}/proto" \
+  --python_out="${ROOT}/sms-service" \
+  --grpc_python_out="${ROOT}/sms-service" \
+  "${ROOT}/proto/sms.proto"

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,9 +161,10 @@ func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmai
 		return &pb.WaitForEmailResponse{Found: true, ContentExtracted: otp}, nil
 	}
 	if err := s.watcher.PollForEmail(ctx, request.GetEmailAddress()); err != nil {
-		return nil, waitError(ctx, err)
-	}
-	if otp, ok := s.watcher.ConsumeCachedOTP(request.GetEmailAddress(), request.GetSubjectKeyword(), issuedAfter); ok {
+		if !isAuthError(err) {
+			return nil, waitError(ctx, err)
+		}
+	} else if otp, ok := s.watcher.ConsumeCachedOTP(request.GetEmailAddress(), request.GetSubjectKeyword(), issuedAfter); ok {
 		return &pb.WaitForEmailResponse{Found: true, ContentExtracted: otp}, nil
 	}
 
@@ -182,7 +184,10 @@ func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmai
 			}
 		}
 		if err := s.watcher.PollForEmail(ctx, request.GetEmailAddress()); err != nil {
-			return nil, waitError(ctx, err)
+			if !isAuthError(err) {
+				return nil, waitError(ctx, err)
+			}
+			continue
 		}
 		if otp, ok := s.watcher.ConsumeCachedOTP(request.GetEmailAddress(), request.GetSubjectKeyword(), issuedAfter); ok {
 			return &pb.WaitForEmailResponse{Found: true, ContentExtracted: otp}, nil
@@ -196,4 +201,14 @@ func waitError(ctx context.Context, err error) error {
 		return status.Error(codes.Canceled, "request cancelled")
 	}
 	return status.Error(codes.Internal, err.Error())
+}
+
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not authorized") ||
+		strings.Contains(msg, "no refresh token") ||
+		strings.Contains(msg, "AUTH_FAILED")
 }

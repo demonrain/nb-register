@@ -1,7 +1,13 @@
-import threading
 import unittest
+from unittest.mock import patch
 
-from payment_server import FlowStore, OtpStore
+import payment_pb2
+import payment_server
+from payment_server import FlowStore, PaymentService
+
+
+TEST_CYCLE_PHONE = "test-cycle-phone"
+TEST_PIN = "000000"
 
 
 class FakeCharger:
@@ -35,48 +41,48 @@ class FlowStoreTests(unittest.TestCase):
         self.assertTrue(charger.closed)
 
 
-class OtpStoreTests(unittest.TestCase):
-    def test_gopay_wait_ignores_non_gopay_and_returns_whatsapp(self):
-        store = OtpStore()
-        store.submit("111111", source="短信", issued_at_unix=100, hint="OpenAI code 111111")
+class PaymentServiceTests(unittest.TestCase):
+    def test_cycle_token_does_not_replace_chatgpt_access_token(self):
+        captured = {}
 
-        timer = threading.Timer(
-            0.05,
-            lambda: store.submit(
-                "222222",
-                source="WhatsApp",
-                issued_at_unix=101,
-                hint="GoPay verification code 222222",
-            ),
-        )
-        timer.start()
-        try:
-            item = store.wait(
-                timeout_seconds=1,
-                issued_after_unix=100,
-                is_active=lambda: True,
-                purpose="gopay",
+        class FakeChatGPTSession:
+            headers = {}
+
+            def close(self):
+                pass
+
+        class FakeGoPayCharger:
+            def __init__(self, chatgpt_session, gopay_cfg, **kwargs):
+                captured["gopay_cfg"] = dict(gopay_cfg)
+                captured["charger_kwargs"] = dict(kwargs)
+
+            def start_until_otp(self, stripe_pk="", billing=None):
+                return {"snap_token": "snap", "issued_after_unix": 123}
+
+        def fake_build_chatgpt_session(auth_cfg, proxy=None):
+            captured["auth_cfg"] = dict(auth_cfg)
+            captured["build_proxy"] = proxy
+            return FakeChatGPTSession()
+
+        svc = PaymentService({"fresh_checkout": {"auth": {}}, "gopay": {"country_code": "62", "phone_number": "", "pin": TEST_PIN}})
+
+        with patch.object(svc, "_ready_cycle_access_token", return_value=("cycle-gopay-token", TEST_CYCLE_PHONE)), \
+                patch.object(payment_server, "_build_chatgpt_session", fake_build_chatgpt_session), \
+                patch.object(payment_server, "resolve_checkout_proxy", return_value="socks5://checkout"), \
+                patch.object(payment_server, "resolve_payment_proxy", return_value="socks5://payment"), \
+                patch.object(payment_server, "GoPayCharger", FakeGoPayCharger):
+            resp = svc.StartGoPay(
+                payment_pb2.StartGoPayRequest(access_token="chatgpt-access-token", use_cycle_token=True),
+                None,
             )
-        finally:
-            timer.cancel()
 
-        self.assertIsNotNone(item)
-        self.assertEqual(item["otp"], "222222")
-        self.assertEqual(item["source"], "WhatsApp")
+        self.assertTrue(resp.success)
+        self.assertEqual(captured["auth_cfg"]["access_token"], "chatgpt-access-token")
+        self.assertEqual(captured["gopay_cfg"]["phone_number"], TEST_CYCLE_PHONE)
+        self.assertEqual(captured["build_proxy"], "socks5://checkout")
+        self.assertEqual(captured["charger_kwargs"]["checkout_proxy"], "socks5://checkout")
+        self.assertEqual(captured["charger_kwargs"]["payment_proxy"], "socks5://payment")
 
-    def test_gopay_wait_accepts_sms_source_when_payload_mentions_gopay(self):
-        store = OtpStore()
-        store.submit("333333", source="短信", issued_at_unix=100, hint="GoPay verification code 333333")
-
-        item = store.wait(
-            timeout_seconds=1,
-            issued_after_unix=100,
-            is_active=lambda: True,
-            purpose="gopay",
-        )
-
-        self.assertIsNotNone(item)
-        self.assertEqual(item["otp"], "333333")
 
 if __name__ == "__main__":
     unittest.main()

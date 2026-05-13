@@ -3,3 +3,4 @@ curl-cffi
 PySocks
 grpcio
 grpcio-tools
+playwright
