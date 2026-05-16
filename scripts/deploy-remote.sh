@@ -122,11 +122,8 @@ needs_camoufox_base() {
 
 docker_context() {
   case "$1" in
-    gopay-payment)
+    account-db|browser-reg|dashboard|gopay-app|gopay-payment|herosms-sms-service|orchestrator|outlook-imap-service|outlook-register-service|whatsapp-otp-relay)
       printf '.'
-      ;;
-    *)
-      printf '%s' "$1"
       ;;
   esac
 }

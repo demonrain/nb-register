@@ -6,6 +6,13 @@ import "google/protobuf/struct.proto";
 
 option go_package = "./;pb";
 
+service JobService {
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc WatchJob(WatchJobRequest) returns (stream WatchJobResponse);
+  rpc WatchJobs(WatchJobsRequest) returns (stream WatchJobsResponse);
+}
+
 message CreateJobInput {
   string job_id = 1;
   string account_id = 2;
@@ -74,6 +81,13 @@ message JobSnapshot {
   int64 event_id = 3;
 }
 
+message JobEvent {
+  int64 event_id = 1;
+  string job_id = 2;
+  string event_type = 3;
+  JobSnapshot snapshot = 4;
+}
+
 message GetJobRequest {
   string job_id = 1;
 }
@@ -101,6 +115,17 @@ message WatchJobRequest {
 }
 
 message WatchJobResponse {
-  JobSnapshot snapshot = 1;
+  JobEvent event = 1;
+  string error_message = 2;
+}
+
+message WatchJobsRequest {
+  repeated string job_ids = 1;
+  string status = 2;
+  int64 after_event_id = 3;
+}
+
+message WatchJobsResponse {
+  JobEvent event = 1;
   string error_message = 2;
 }

@@ -2,39 +2,4 @@ syntax = "proto3";
 
 package orchestrator;
 
-import "orchestrator_account.proto";
-import "orchestrator_gopay_app.proto";
-import "orchestrator_job.proto";
-import "orchestrator_mailbox.proto";
-import "orchestrator_otp.proto";
-import "orchestrator_payment.proto";
-
 option go_package = "./;pb";
-
-service OrchestratorService {
-  rpc RegisterAccount(RegisterAccountRequest) returns (RegisterAccountResponse);
-  rpc ActivateAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
-  rpc AutopayAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
-  rpc LoginAccount(LoginAccountRequest) returns (LoginAccountResponse);
-  rpc ProbeAccount(ProbeAccountRequest) returns (ProbeAccountResponse);
-  rpc RunGoPayApp(GoPayAppRequest) returns (GoPayAppResponse);
-  rpc RegisterAndActivateAccount(RegisterAndActivateAccountRequest) returns (RegisterAndActivateAccountResponse);
-  rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
-  rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);
-  rpc FetchMailboxInboxes(FetchMailboxInboxesRequest) returns (FetchMailboxInboxesResponse);
-  rpc SubmitRegistrationOtp(SubmitRegistrationOtpRequest) returns (SubmitRegistrationOtpResponse);
-  rpc GetJob(GetJobRequest) returns (GetJobResponse);
-  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
-  rpc WatchJob(WatchJobRequest) returns (stream WatchJobResponse);
-  rpc GoPayUserStatus(GoPayUserStatusRequest) returns (GoPayUserStatusResponse);
-  rpc GoPayUserClearState(GoPayUserClearStateRequest) returns (GoPayUserClearStateResponse);
-  rpc GoPayUserAuthStart(GoPayUserAuthStartRequest) returns (GoPayUserAuthStartResponse);
-  rpc GoPayUserAuthComplete(GoPayUserAuthCompleteRequest) returns (GoPayUserAuthCompleteResponse);
-  rpc GoPayUserChangePhoneStart(GoPayUserChangePhoneStartRequest) returns (GoPayUserChangePhoneStartResponse);
-  rpc GoPayUserChangePhoneComplete(GoPayUserChangePhoneCompleteRequest) returns (GoPayUserChangePhoneCompleteResponse);
-  rpc GoPayUserChangePhoneRetry(GoPayUserChangePhoneRetryRequest) returns (GoPayUserChangePhoneRetryResponse);
-  rpc GoPayUserSignupStart(GoPayUserSignupStartRequest) returns (GoPayUserSignupStartResponse);
-  rpc GoPayUserSignupComplete(GoPayUserSignupCompleteRequest) returns (GoPayUserSignupCompleteResponse);
-  rpc GoPayUserCreatePinStart(GoPayUserCreatePinStartRequest) returns (GoPayUserCreatePinStartResponse);
-  rpc GoPayUserCreatePinComplete(GoPayUserCreatePinCompleteRequest) returns (GoPayUserCreatePinCompleteResponse);
-}

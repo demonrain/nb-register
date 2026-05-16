@@ -45,7 +45,19 @@ type JobStep struct {
 	UpdatedAt    int64 `gorm:"autoUpdateTime"`
 }
 
-func InitDB() *gorm.DB {
+type JobEvent struct {
+	EventID      int64  `gorm:"primaryKey;autoIncrement;column:event_id"`
+	JobID        string `gorm:"index"`
+	EventType    string `gorm:"index"`
+	SnapshotJSON string
+	CreatedAt    int64 `gorm:"autoCreateTime"`
+}
+
+func (JobEvent) TableName() string {
+	return "job_events"
+}
+
+func DSN() string {
 	dsn := strings.TrimSpace(os.Getenv("ORCHESTRATOR_PG_DSN"))
 	if dsn == "" {
 		dsn = strings.TrimSpace(os.Getenv("PG_DSN"))
@@ -53,11 +65,16 @@ func InitDB() *gorm.DB {
 	if dsn == "" {
 		log.Fatal("ORCHESTRATOR_PG_DSN or PG_DSN is required")
 	}
+	return dsn
+}
+
+func InitDB() *gorm.DB {
+	dsn := DSN()
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("failed to connect to PostgreSQL database: %v", err)
 	}
-	db.AutoMigrate(&Job{}, &JobParam{}, &JobStep{})
+	db.AutoMigrate(&Job{}, &JobParam{}, &JobStep{}, &JobEvent{})
 	return db
 }

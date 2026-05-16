@@ -5,14 +5,21 @@ import (
 
 	temporalclient "go.temporal.io/sdk/client"
 	"gorm.io/gorm"
+	"orchestrator/internal/jobevents"
 	"orchestrator/internal/jobprojection"
 	"orchestrator/pb"
 )
 
 type orchestratorServer struct {
-	pb.UnimplementedOrchestratorServiceServer
+	pb.UnimplementedAccountWorkflowServiceServer
+	pb.UnimplementedPaymentWorkflowServiceServer
+	pb.UnimplementedGoPayAppWorkflowServiceServer
+	pb.UnimplementedMailboxWorkflowServiceServer
+	pb.UnimplementedOTPServiceServer
+	pb.UnimplementedJobServiceServer
 	db                                *gorm.DB
 	jobStore                          *jobprojection.Store
+	jobEvents                         *jobevents.Store
 	accountClient                     pb.AccountDatabaseServiceClient
 	browserClient                     pb.BrowserRegistrationClient
 	paymentClient                     pb.PaymentServiceClient

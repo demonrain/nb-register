@@ -11,14 +11,16 @@ import (
 	"gorm.io/gorm"
 
 	"orchestrator/db"
+	"orchestrator/internal/jobevents"
 	"orchestrator/internal/jobprojection"
 	"orchestrator/pb"
 )
 
 type orchestratorDependencies struct {
-	db       *gorm.DB
-	jobStore *jobprojection.Store
-	temporal temporalclient.Client
+	db        *gorm.DB
+	jobStore  *jobprojection.Store
+	jobEvents *jobevents.Store
+	temporal  temporalclient.Client
 
 	accountClient         pb.AccountDatabaseServiceClient
 	browserClient         pb.BrowserRegistrationClient
@@ -95,7 +97,9 @@ func newOrchestratorDependencies(cfg orchestratorConfig) (*orchestratorDependenc
 
 	database := db.InitDB()
 	deps.db = database
-	deps.jobStore = jobprojection.NewStore(database)
+	deps.jobEvents = jobevents.NewStore(database, db.DSN())
+	deps.addCloser(deps.jobEvents.Close)
+	deps.jobStore = jobprojection.NewStore(database).WithPublisher(deps.jobEvents)
 	deps.accountClient = pb.NewAccountDatabaseServiceClient(accountDBConn)
 	deps.browserClient = pb.NewBrowserRegistrationClient(browserConn)
 	deps.paymentClient = pb.NewPaymentServiceClient(paymentConn)

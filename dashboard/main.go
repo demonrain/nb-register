@@ -28,13 +28,18 @@ import (
 )
 
 type server struct {
-	accountClient      pb.AccountDatabaseServiceClient
-	orchestratorClient pb.OrchestratorServiceClient
-	paymentClient      pb.PaymentServiceClient
-	emailClient        pb.EmailServiceClient
-	staticDir          string
-	mailboxRegisterMu  sync.Mutex
-	mailboxRegistering bool
+	accountClient         pb.AccountDatabaseServiceClient
+	accountWorkflowClient pb.AccountWorkflowServiceClient
+	paymentWorkflowClient pb.PaymentWorkflowServiceClient
+	gopayAppClient        pb.GoPayAppWorkflowServiceClient
+	mailboxClient         pb.MailboxWorkflowServiceClient
+	otpClient             pb.OTPServiceClient
+	jobClient             pb.JobServiceClient
+	paymentClient         pb.PaymentServiceClient
+	emailClient           pb.EmailServiceClient
+	staticDir             string
+	mailboxRegisterMu     sync.Mutex
+	mailboxRegistering    bool
 }
 
 type createAccountRequest struct {
@@ -106,11 +111,16 @@ func main() {
 	defer emailConn.Close()
 
 	s := &server{
-		accountClient:      pb.NewAccountDatabaseServiceClient(accountConn),
-		orchestratorClient: pb.NewOrchestratorServiceClient(orchestratorConn),
-		paymentClient:      pb.NewPaymentServiceClient(paymentConn),
-		emailClient:        pb.NewEmailServiceClient(emailConn),
-		staticDir:          envDefault("STATIC_DIR", "web/dist"),
+		accountClient:         pb.NewAccountDatabaseServiceClient(accountConn),
+		accountWorkflowClient: pb.NewAccountWorkflowServiceClient(orchestratorConn),
+		paymentWorkflowClient: pb.NewPaymentWorkflowServiceClient(orchestratorConn),
+		gopayAppClient:        pb.NewGoPayAppWorkflowServiceClient(orchestratorConn),
+		mailboxClient:         pb.NewMailboxWorkflowServiceClient(orchestratorConn),
+		otpClient:             pb.NewOTPServiceClient(orchestratorConn),
+		jobClient:             pb.NewJobServiceClient(orchestratorConn),
+		paymentClient:         pb.NewPaymentServiceClient(paymentConn),
+		emailClient:           pb.NewEmailServiceClient(emailConn),
+		staticDir:             envDefault("STATIC_DIR", "web/dist"),
 	}
 
 	mux := http.NewServeMux()
@@ -123,6 +133,7 @@ func main() {
 	mux.HandleFunc("/api/mailboxes/", s.handleMailbox)
 	mux.HandleFunc("/api/mailboxes", s.handleMailboxes)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
+	mux.HandleFunc("/api/jobs/events", s.streamJobsEvents)
 	mux.HandleFunc("/api/jobs/", s.handleJob)
 	mux.HandleFunc("/api/workflows/register", s.handleRegister)
 	mux.HandleFunc("/api/workflows/activate", s.handleActivate)
@@ -279,7 +290,7 @@ func (s *server) handleMailboxRegister(w http.ResponseWriter, r *http.Request) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(envInt("MAILBOX_REGISTER_TIMEOUT_SECONDS", 1800))*time.Second)
 		defer cancel()
-		resp, err := s.orchestratorClient.RegisterMailbox(ctx, &pb.RegisterMailboxRequest{})
+		resp, err := s.mailboxClient.RegisterMailbox(ctx, &pb.RegisterMailboxRequest{})
 		if err != nil {
 			log.Printf("mailbox registration workflow failed to start: %v", err)
 			return
@@ -317,7 +328,7 @@ func (s *server) handleMailboxOAuth(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	resp, err := s.orchestratorClient.RunMailboxOAuth(ctx, &pb.StartMailboxOAuthRequest{
+	resp, err := s.mailboxClient.RunMailboxOAuth(ctx, &pb.StartMailboxOAuthRequest{
 		EmailAddress: strings.TrimSpace(req.EmailAddress),
 		OnlyMissing:  req.OnlyMissing,
 		Limit:        req.Limit,
@@ -369,7 +380,7 @@ func (s *server) handleMailboxInbox(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	resp, err := s.orchestratorClient.FetchMailboxInboxes(ctx, &pb.FetchMailboxInboxesRequest{
+	resp, err := s.mailboxClient.FetchMailboxInboxes(ctx, &pb.FetchMailboxInboxesRequest{
 		LimitPerMailbox: req.LimitPerMailbox,
 		MaxMailboxes:    req.MaxMailboxes,
 		EmailAddress:    strings.TrimSpace(req.EmailAddress),
@@ -756,7 +767,7 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.orchestratorClient.ListJobs(r.Context(), &pb.ListJobsRequest{
+	resp, err := s.jobClient.ListJobs(r.Context(), &pb.ListJobsRequest{
 		Limit:     int32(queryInt(r, "limit", 100)),
 		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
 		Action:    strings.TrimSpace(r.URL.Query().Get("action")),
@@ -791,13 +802,6 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 			}
 			s.submitJobOTP(w, r, jobID)
 			return
-		case "events":
-			if r.Method != http.MethodGet {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
-			}
-			s.streamJobEvents(w, r, jobID)
-			return
 		default:
 			writeError(w, http.StatusNotFound, fmt.Errorf("unsupported job action: %s", parts[1]))
 			return
@@ -808,7 +812,7 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	resp, err := s.orchestratorClient.GetJob(r.Context(), &pb.GetJobRequest{JobId: jobID})
+	resp, err := s.jobClient.GetJob(r.Context(), &pb.GetJobRequest{JobId: jobID})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -820,7 +824,11 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp.GetSnapshot())
 }
 
-func (s *server) streamJobEvents(w http.ResponseWriter, r *http.Request, jobID string) {
+func (s *server) streamJobsEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
@@ -831,8 +839,8 @@ func (s *server) streamJobEvents(w http.ResponseWriter, r *http.Request, jobID s
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	stream, err := s.orchestratorClient.WatchJob(r.Context(), &pb.WatchJobRequest{
-		JobId:        jobID,
+	stream, err := s.jobClient.WatchJobs(r.Context(), &pb.WatchJobsRequest{
+		JobIds:       requestJobIDs(r),
 		AfterEventId: requestLastEventID(r),
 	})
 	if err != nil {
@@ -855,11 +863,11 @@ func (s *server) streamJobEvents(w http.ResponseWriter, r *http.Request, jobID s
 			flusher.Flush()
 			return
 		}
-		snapshot := event.GetSnapshot()
-		if snapshot == nil {
+		jobEvent := event.GetEvent()
+		if jobEvent == nil {
 			continue
 		}
-		_, _ = fmt.Fprintf(w, "id: %d\nevent: job\ndata: %s\n\n", snapshot.GetEventId(), sseJSON(snapshot))
+		_, _ = fmt.Fprintf(w, "id: %d\nevent: job\ndata: %s\n\n", jobEvent.GetEventId(), sseJSON(jobEvent))
 		flusher.Flush()
 	}
 }
@@ -872,8 +880,33 @@ func sseJSON(value any) string {
 	return string(b)
 }
 
+func requestJobIDs(r *http.Request) []string {
+	query := r.URL.Query()
+	values := append([]string{}, query["job_id"]...)
+	values = append(values, query["job_ids"]...)
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 func requestLastEventID(r *http.Request) int64 {
 	value := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if value == "" {
+		value = strings.TrimSpace(r.URL.Query().Get("after_event_id"))
+	}
 	if value == "" {
 		return 0
 	}
@@ -891,7 +924,7 @@ func (s *server) submitJobOTP(w http.ResponseWriter, r *http.Request, jobID stri
 		return
 	}
 
-	resp, err := s.orchestratorClient.SubmitRegistrationOtp(r.Context(), &pb.SubmitRegistrationOtpRequest{
+	resp, err := s.otpClient.SubmitRegistrationOtp(r.Context(), &pb.SubmitRegistrationOtpRequest{
 		JobId: jobID,
 		Otp:   req.OTP,
 	})
@@ -916,7 +949,7 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.RegisterAccount(r.Context(), &req)
+	resp, err := s.accountWorkflowClient.RegisterAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -934,7 +967,7 @@ func (s *server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.ActivateAccount(r.Context(), &req)
+	resp, err := s.paymentWorkflowClient.ActivateAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -952,7 +985,7 @@ func (s *server) handleAutopay(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.AutopayAccount(r.Context(), &req)
+	resp, err := s.paymentWorkflowClient.AutopayAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -970,7 +1003,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.LoginAccount(r.Context(), &req)
+	resp, err := s.accountWorkflowClient.LoginAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -992,7 +1025,7 @@ func (s *server) handleProbeAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.ProbeAccount(r.Context(), &req)
+	resp, err := s.paymentWorkflowClient.ProbeAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -1014,7 +1047,7 @@ func (s *server) handleGoPayApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.RunGoPayApp(r.Context(), &req)
+	resp, err := s.gopayAppClient.RunGoPayApp(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -1036,7 +1069,7 @@ func (s *server) handleRegisterAndActivate(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.orchestratorClient.RegisterAndActivateAccount(r.Context(), &req)
+	resp, err := s.accountWorkflowClient.RegisterAndActivateAccount(r.Context(), &req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return

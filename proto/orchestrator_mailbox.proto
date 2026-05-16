@@ -7,6 +7,12 @@ import "google/protobuf/struct.proto";
 
 option go_package = "./;pb";
 
+service MailboxWorkflowService {
+  rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
+  rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);
+  rpc FetchMailboxInboxes(FetchMailboxInboxesRequest) returns (FetchMailboxInboxesResponse);
+}
+
 message RegisteredMailboxResult {
   string email_address = 1;
   string status = 2;

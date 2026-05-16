@@ -7,6 +7,21 @@ import "google/protobuf/struct.proto";
 
 option go_package = "./;pb";
 
+service GoPayAppWorkflowService {
+  rpc RunGoPayApp(GoPayAppRequest) returns (GoPayAppResponse);
+  rpc GoPayUserStatus(GoPayUserStatusRequest) returns (GoPayUserStatusResponse);
+  rpc GoPayUserClearState(GoPayUserClearStateRequest) returns (GoPayUserClearStateResponse);
+  rpc GoPayUserAuthStart(GoPayUserAuthStartRequest) returns (GoPayUserAuthStartResponse);
+  rpc GoPayUserAuthComplete(GoPayUserAuthCompleteRequest) returns (GoPayUserAuthCompleteResponse);
+  rpc GoPayUserChangePhoneStart(GoPayUserChangePhoneStartRequest) returns (GoPayUserChangePhoneStartResponse);
+  rpc GoPayUserChangePhoneComplete(GoPayUserChangePhoneCompleteRequest) returns (GoPayUserChangePhoneCompleteResponse);
+  rpc GoPayUserChangePhoneRetry(GoPayUserChangePhoneRetryRequest) returns (GoPayUserChangePhoneRetryResponse);
+  rpc GoPayUserSignupStart(GoPayUserSignupStartRequest) returns (GoPayUserSignupStartResponse);
+  rpc GoPayUserSignupComplete(GoPayUserSignupCompleteRequest) returns (GoPayUserSignupCompleteResponse);
+  rpc GoPayUserCreatePinStart(GoPayUserCreatePinStartRequest) returns (GoPayUserCreatePinStartResponse);
+  rpc GoPayUserCreatePinComplete(GoPayUserCreatePinCompleteRequest) returns (GoPayUserCreatePinCompleteResponse);
+}
+
 message EnsureLogonRequest {
   string job_id = 1;
   string account_id = 2;

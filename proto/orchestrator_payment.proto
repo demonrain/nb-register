@@ -6,6 +6,12 @@ import "google/protobuf/struct.proto";
 
 option go_package = "./;pb";
 
+service PaymentWorkflowService {
+  rpc ActivateAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
+  rpc AutopayAccount(ActivateAccountRequest) returns (ActivateAccountResponse);
+  rpc ProbeAccount(ProbeAccountRequest) returns (ProbeAccountResponse);
+}
+
 message PersistActivatedInput {
   string account_id = 1;
   string session_token = 2;

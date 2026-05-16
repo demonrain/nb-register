@@ -6,6 +6,12 @@ import "google/protobuf/struct.proto";
 
 option go_package = "./;pb";
 
+service AccountWorkflowService {
+  rpc RegisterAccount(RegisterAccountRequest) returns (RegisterAccountResponse);
+  rpc LoginAccount(LoginAccountRequest) returns (LoginAccountResponse);
+  rpc RegisterAndActivateAccount(RegisterAndActivateAccountRequest) returns (RegisterAndActivateAccountResponse);
+}
+
 message AccountSpec {
   string account_id = 1;
   string email = 2;

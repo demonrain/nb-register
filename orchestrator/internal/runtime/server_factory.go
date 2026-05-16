@@ -4,6 +4,7 @@ func newOrchestratorServer(cfg orchestratorConfig, deps *orchestratorDependencie
 	return &orchestratorServer{
 		db:                                deps.db,
 		jobStore:                          deps.jobStore,
+		jobEvents:                         deps.jobEvents,
 		accountClient:                     deps.accountClient,
 		browserClient:                     deps.browserClient,
 		paymentClient:                     deps.paymentClient,

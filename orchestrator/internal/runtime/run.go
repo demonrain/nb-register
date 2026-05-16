@@ -35,7 +35,12 @@ func Run() {
 	}()
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterOrchestratorServiceServer(grpcServer, server)
+	pb.RegisterAccountWorkflowServiceServer(grpcServer, server)
+	pb.RegisterPaymentWorkflowServiceServer(grpcServer, server)
+	pb.RegisterGoPayAppWorkflowServiceServer(grpcServer, server)
+	pb.RegisterMailboxWorkflowServiceServer(grpcServer, server)
+	pb.RegisterOTPServiceServer(grpcServer, server)
+	pb.RegisterJobServiceServer(grpcServer, server)
 
 	log.Printf("Orchestrator gRPC API listening on %s", cfg.ListenAddr)
 	if err := grpcServer.Serve(lis); err != nil {

@@ -44,6 +44,7 @@ import {
   TableRow
 } from '@/components/ui/table';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import type { Job, JobEvent, JobSnapshot, JobStep as Step, WorkflowProgress } from './proto/orchestrator_job';
 import './styles.css';
 
 type Account = {
@@ -66,36 +67,6 @@ type CheckoutLinkResponse = {
   error_message?: string;
   checkout_url: string;
   checkout_session_id: string;
-};
-
-type Job = {
-  job_id: string;
-  account_id: string;
-  action: string;
-  status: string;
-  recoverable: boolean;
-  retryable: boolean;
-  last_step: string;
-  error_message: string;
-  result_json: string;
-  created_at: number;
-  updated_at: number;
-  steps?: Step[];
-};
-
-type WorkflowProgress = {
-  job_id: string;
-  workflow: string;
-  step_name: string;
-  status: string;
-  error_message: string;
-  updated_at_unix: number;
-};
-
-type JobSnapshot = {
-  job?: Job;
-  progress?: WorkflowProgress;
-  event_id: number;
 };
 
 function snapshotEventID(snapshot: JobSnapshot) {
@@ -190,17 +161,6 @@ type AccountMailboxContext = {
   primary_email: string;
   is_split: boolean;
   known: boolean;
-};
-
-type Step = {
-  step_name: string;
-  status: string;
-  recoverable: boolean;
-  retryable: boolean;
-  error_message: string;
-  result_json: string;
-  started_at: number;
-  completed_at: number;
 };
 
 type Toast = { kind: 'ok' | 'error'; text: string } | null;
@@ -598,30 +558,28 @@ function App() {
     if (!runningJobIDsKey) {
       return;
     }
-    const sources = runningJobIDsKey.split('|').map((jobID) => {
-      const source = new EventSource(`/api/jobs/${jobID}/events`);
-      source.addEventListener('job', (event) => {
-        const snapshot = JSON.parse((event as MessageEvent).data) as JobSnapshot;
-        applyJobSnapshot(snapshot);
-        if (snapshot.job && snapshot.job.status !== 'RUNNING') {
-          source.close();
-        }
-      });
-      source.addEventListener('error', (event) => {
-        const data = (event as MessageEvent).data;
-        if (!data) return;
-        try {
-          const payload = JSON.parse(data) as { error?: string };
-          if (payload.error) setToast({ kind: 'error', text: payload.error });
-        } catch {
-          setToast({ kind: 'error', text: '工作流事件流解析失败' });
-        }
-        source.close();
-      });
-      return source;
+    const params = new URLSearchParams();
+    runningJobIDsKey.split('|').forEach((jobID) => params.append('job_id', jobID));
+    const source = new EventSource(`/api/jobs/events?${params.toString()}`);
+    source.addEventListener('job', (event) => {
+      const jobEvent = JSON.parse((event as MessageEvent).data) as JobEvent;
+      if (jobEvent.snapshot) {
+        applyJobSnapshot(jobEvent.snapshot);
+      }
+    });
+    source.addEventListener('error', (event) => {
+      const data = (event as MessageEvent).data;
+      if (!data) return;
+      try {
+        const payload = JSON.parse(data) as { error?: string };
+        if (payload.error) setToast({ kind: 'error', text: payload.error });
+      } catch {
+        setToast({ kind: 'error', text: '工作流事件流解析失败' });
+      }
+      source.close();
     });
     return () => {
-      sources.forEach((source) => source.close());
+      source.close();
     };
   }, [runningJobIDsKey, applyJobSnapshot]);
 

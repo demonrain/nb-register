@@ -15,12 +15,12 @@ class OrchestratorGopayClient:
         if self._stub is not None:
             return self._pb2, self._stub
         import grpc
-        import orchestrator_pb2
-        import orchestrator_pb2_grpc
+        import orchestrator_gopay_app_pb2
+        import orchestrator_gopay_app_pb2_grpc
 
         channel = grpc.insecure_channel(self.addr)
-        self._pb2 = orchestrator_pb2
-        self._stub = orchestrator_pb2_grpc.OrchestratorServiceStub(channel)
+        self._pb2 = orchestrator_gopay_app_pb2
+        self._stub = orchestrator_gopay_app_pb2_grpc.GoPayAppWorkflowServiceStub(channel)
         return self._pb2, self._stub
 
     def status(self, state_key: str):

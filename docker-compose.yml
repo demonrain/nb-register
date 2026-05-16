@@ -40,8 +40,8 @@ services:
 
   outlook-imap-service:
     build:
-      context: ./outlook-imap-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: outlook-imap-service/Dockerfile
     init: true
     ports:
       - "${OUTLOOK_GRPC_PORT:-50053}:50051" # gRPC
@@ -65,8 +65,8 @@ services:
 
   outlook-register-service:
     build:
-      context: ./outlook-register-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: outlook-register-service/Dockerfile
     init: true
     ports:
       - "${OUTLOOK_REGISTER_GRPC_PORT:-50056}:50051" # gRPC
@@ -102,8 +102,8 @@ services:
 
   account-db:
     build:
-      context: ./account-db
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: account-db/Dockerfile
     ports:
       - "${ACCOUNT_DB_GRPC_PORT:-50052}:50051"
     environment:
@@ -118,8 +118,8 @@ services:
 
   orchestrator:
     build:
-      context: ./orchestrator
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: orchestrator/Dockerfile
     ports:
       - "${ORCHESTRATOR_GRPC_PORT:-50055}:50051" # API
     environment:
@@ -185,8 +185,8 @@ services:
 
   whatsapp-otp-relay:
     build:
-      context: ./whatsapp-otp-relay
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: whatsapp-otp-relay/Dockerfile
     ports:
       - "127.0.0.1:${WHATSAPP_OTP_RELAY_GRPC_PORT:-50057}:50051"
       - "0.0.0.0:${GOPAY_WEBHOOK_PORT:-8081}:8081"
@@ -199,8 +199,8 @@ services:
 
   gopay-app:
     build:
-      context: ./gopay-app
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: gopay-app/Dockerfile
     ports:
       - "127.0.0.1:${GOPAY_APP_PORT:-50060}:50051"
     environment:
@@ -254,8 +254,8 @@ services:
 
   herosms-sms-service:
     build:
-      context: ./herosms-sms-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: herosms-sms-service/Dockerfile
     ports:
       - "127.0.0.1:${HEROSMS_SMS_SERVICE_PORT:-50061}:50051"
     environment:
@@ -276,8 +276,8 @@ services:
 
   dashboard:
     build:
-      context: ./dashboard
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: dashboard/Dockerfile
     ports:
       - "${DASHBOARD_PORT:-8080}:8080"
     environment:
@@ -298,8 +298,8 @@ services:
 
   browser-reg:
     build:
-      context: ./browser-reg
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: browser-reg/Dockerfile
     init: true
     mem_limit: ${BROWSER_REG_MEM_LIMIT:-4g}
     ports:

@@ -5,9 +5,9 @@ WORKDIR /app
 COPY proto/mailbox_register.proto /app/proto/mailbox_register.proto
 RUN python -m grpc_tools.protoc -I /app/proto --python_out=/app --grpc_python_out=/app /app/proto/mailbox_register.proto
 
-COPY register_provider.py /app/register_provider.py
-COPY register_service.py /app/register_service.py
-COPY camoufox_register.py /app/camoufox_register.py
+COPY outlook-register-service/register_provider.py /app/register_provider.py
+COPY outlook-register-service/register_service.py /app/register_service.py
+COPY outlook-register-service/camoufox_register.py /app/camoufox_register.py
 
 RUN mkdir -p /app/Results
 

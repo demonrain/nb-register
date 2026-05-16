@@ -1,7 +1,8 @@
 FROM nb-register-camoufox-base:latest
 
 # --- Application ---
-COPY . /app
+COPY browser-reg /app
+COPY proto/browser.proto /app/proto/browser.proto
 WORKDIR /app
 
 # --- Compile proto ---

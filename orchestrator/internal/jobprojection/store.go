@@ -18,7 +18,12 @@ import (
 )
 
 type Store struct {
-	db *gorm.DB
+	db        *gorm.DB
+	publisher EventPublisher
+}
+
+type EventPublisher interface {
+	PublishSnapshot(ctx context.Context, eventType string, snapshot *pb.JobSnapshot) (*pb.JobEvent, error)
 }
 
 type StepFailure struct {
@@ -40,6 +45,11 @@ type ListFilter struct {
 
 func NewStore(db *gorm.DB) *Store {
 	return &Store{db: db}
+}
+
+func (s *Store) WithPublisher(publisher EventPublisher) *Store {
+	s.publisher = publisher
+	return s
 }
 
 func (s *Store) Create(ctx context.Context, accountID, action string, params map[string]string) (*db.Job, error) {
@@ -66,6 +76,7 @@ func (s *Store) CreateWithID(ctx context.Context, jobID, accountID, action strin
 	if err != nil {
 		return nil, err
 	}
+	s.publish(ctx, "job_created", job.ID)
 	return job, nil
 }
 
@@ -109,6 +120,7 @@ func (s *Store) Update(ctx context.Context, jobID, statusValue, errorMessage str
 	if err := s.db.WithContext(ctx).Model(&db.Job{}).Where("id = ?", jobID).Updates(updates).Error; err != nil {
 		log.Printf("[orchestrator] update job failed job=%s: %v", jobID, err)
 	}
+	s.publish(ctx, "job_updated", jobID)
 }
 
 func (s *Store) Get(ctx context.Context, jobID string) (*db.Job, error) {
@@ -218,7 +230,7 @@ func (s *Store) StartStep(ctx context.Context, jobID, stepName string, recoverab
 		StartedAt:   startedAt,
 	}
 
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "job_id"}, {Name: "step_name"}},
 			DoUpdates: clause.Assignments(map[string]any{
@@ -240,7 +252,11 @@ func (s *Store) StartStep(ctx context.Context, jobID, stepName string, recoverab
 			"last_step":     stepName,
 			"error_message": "",
 		}).Error
-	})
+	}); err != nil {
+		return err
+	}
+	s.publish(ctx, "step_started", jobID)
+	return nil
 }
 
 func (s *Store) CompleteStep(ctx context.Context, jobID, stepName string, recoverable bool, retryable bool, result any, stepErr error) error {
@@ -267,6 +283,7 @@ func (s *Store) CompleteStep(ctx context.Context, jobID, stepName string, recove
 	}
 
 	if stepErr == nil {
+		s.publish(ctx, "step_completed", jobID)
 		return nil
 	}
 	if err := s.db.WithContext(ctx).Model(&db.Job{}).Where("id = ?", jobID).Updates(map[string]any{
@@ -278,6 +295,7 @@ func (s *Store) CompleteStep(ctx context.Context, jobID, stepName string, recove
 	}).Error; err != nil {
 		log.Printf("[orchestrator] update failed job failed job=%s step=%s: %v", jobID, stepName, err)
 	}
+	s.publish(ctx, "step_failed", jobID)
 	return stepErr
 }
 
@@ -291,6 +309,7 @@ func (s *Store) UpdateRunningStepData(ctx context.Context, jobID, stepName strin
 		Update("result_json", resultJSON).Error; err != nil {
 		log.Printf("[orchestrator] update running step data failed job=%s step=%s: %v", jobID, stepName, err)
 	}
+	s.publish(ctx, "step_progress", jobID)
 }
 
 func (s *Store) MarkStepFailed(ctx context.Context, input StepFailure) error {
@@ -316,10 +335,14 @@ func (s *Store) MarkStepFailed(ctx context.Context, input StepFailure) error {
 			updates["result_json"] = resultJSON
 		}
 	}
-	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
+	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "job_id"}, {Name: "step_name"}},
 		DoUpdates: clause.Assignments(updates),
-	}).Create(&step).Error
+	}).Create(&step).Error; err != nil {
+		return err
+	}
+	s.publish(ctx, "step_failed", input.JobID)
+	return nil
 }
 
 func ToProto(job *db.Job, steps []db.JobStep) *pb.Job {
@@ -376,6 +399,20 @@ func BuildSnapshot(job *db.Job, steps []db.JobStep) *pb.JobSnapshot {
 		Job:      ToProto(job, steps),
 		Progress: progress,
 		EventId:  eventID(job, steps, progress),
+	}
+}
+
+func (s *Store) publish(ctx context.Context, eventType, jobID string) {
+	if s == nil || s.publisher == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	snapshot, err := s.GetSnapshot(ctx, jobID)
+	if err != nil {
+		log.Printf("[orchestrator] build job event snapshot failed event=%s job=%s: %v", eventType, jobID, err)
+		return
+	}
+	if _, err := s.publisher.PublishSnapshot(ctx, eventType, snapshot); err != nil {
+		log.Printf("[orchestrator] publish job event failed event=%s job=%s: %v", eventType, jobID, err)
 	}
 }
 

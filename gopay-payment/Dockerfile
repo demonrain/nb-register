@@ -29,6 +29,7 @@ COPY gopay-payment/gopay-flow/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY gopay-payment/gopay-flow/ /app/gopay-flow/
+COPY proto/payment.proto /app/gopay-flow/proto/payment.proto
 COPY gopay-payment/NOTICE gopay-payment/LICENSE gopay-payment/run_gopay.sh gopay-payment/run_payment_server.sh /app/
 
 WORKDIR /app/gopay-flow
