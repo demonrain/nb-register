@@ -50,6 +50,7 @@ type PersistRegisteredInput = pb.PersistRegisteredInput
 type PersistActivatedInput = pb.PersistActivatedInput
 type JobFailureInput = pb.JobFailureInput
 type JobSuccessInput = pb.JobSuccessInput
+type WorkflowProgress = pb.WorkflowProgress
 
 type MailboxRegistrationActivityInput = pb.MailboxRegistrationActivityInput
 type MailboxRegistrationActivityOutput = pb.MailboxRegistrationActivityOutput

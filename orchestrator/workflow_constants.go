@@ -33,5 +33,6 @@ const (
 	markJobFailedActivityName                   = "MarkJobFailedActivity"
 	markJobSucceededActivityName                = "MarkJobSucceededActivity"
 
-	manualOTPSignalName = "manual_otp_available"
+	manualOTPSignalName       = "manual_otp_available"
+	workflowProgressQueryName = "progress"
 )

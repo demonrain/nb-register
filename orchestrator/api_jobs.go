@@ -24,19 +24,3 @@ func (s *orchestratorServer) GetJob(ctx context.Context, req *pb.GetJobRequest) 
 
 	return &pb.GetJobResponse{Job: jobToProto(job, steps)}, nil
 }
-
-func (s *orchestratorServer) RequestAccount(ctx context.Context, req *pb.RequestAccountRequest) (*pb.RequestAccountResponse, error) {
-	resp, err := s.RegisterAccount(ctx, &pb.RegisterAccountRequest{})
-	if err != nil {
-		return nil, err
-	}
-
-	return &pb.RequestAccountResponse{
-		JobId:             resp.JobId,
-		SessionToken:      resp.SessionToken,
-		AccessToken:       resp.AccessToken,
-		PlusTrialEligible: resp.PlusTrialEligible,
-		ErrorMessage:      resp.ErrorMessage,
-		CheckoutUrl:       resp.CheckoutUrl,
-	}, nil
-}

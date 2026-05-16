@@ -9,10 +9,15 @@ import (
 )
 
 func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayAppWorkflowResult, error) {
+	progress := newWorkflowProgress(ctx, "GoPayAppWorkflow", input.GetJobId())
 	result := GoPayAppWorkflowResult{JobId: input.GetJobId()}
+	defer func() {
+		finishWorkflowProgressOnError(ctx, progress, result.GetErrorMessage())
+	}()
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	gopayCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
 
+	setWorkflowProgress(ctx, progress, "create_job")
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobId:  input.GetJobId(),
 		Action: actionGoPayApp,
@@ -22,6 +27,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	}
 
 	combined := map[string]any{}
+	setWorkflowProgress(ctx, progress, stepGoPayAppLogin)
 	login, err := runGoPayAppAuth(ctx, gopayCtx, retryCtx, input.GetJobId())
 	if err != nil {
 		combined["login"] = protoDataMap(login.GetData())
@@ -29,6 +35,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	}
 	combined["login"] = protoDataMap(login.GetData())
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppChangePhone)
 	changePhone, err := runGoPayAppChangePhone(ctx, gopayCtx, input.GetJobId())
 	if err != nil {
 		combined["change_phone"] = protoDataMap(changePhone.GetData())
@@ -38,6 +45,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	result.ActivationId = changePhone.GetActivationId()
 	result.ChangePhoneComplete = changePhone.GetChangePhoneComplete()
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppDeactivate)
 	deactivate, err := runGoPayAppDeactivate(ctx, gopayCtx, input.GetJobId(), changePhone.GetActivationId())
 	if err != nil {
 		combined["deactivate"] = protoDataMap(deactivate.GetData())
@@ -46,6 +54,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	combined["deactivate"] = protoDataMap(deactivate.GetData())
 	result.DeactivateComplete = deactivate.GetDeactivateComplete()
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppSignup)
 	signup, err := runGoPayAppSignup(ctx, gopayCtx, retryCtx, input.GetJobId())
 	if err != nil {
 		combined["signup"] = protoDataMap(signup.GetData())
@@ -54,6 +63,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	combined["signup"] = protoDataMap(signup.GetData())
 	result.SignupComplete = signup.GetSignupComplete()
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppCreatePin)
 	createPin, err := runGoPayAppCreatePin(ctx, gopayCtx, retryCtx, input.GetJobId())
 	if err != nil {
 		combined["create_pin"] = protoDataMap(createPin.GetData())
@@ -69,6 +79,7 @@ func GoPayAppWorkflow(ctx workflow.Context, input GoPayAppWorkflowInput) (GoPayA
 	}).Get(ctx, nil)
 
 	result.Success = true
+	setWorkflowProgressSucceeded(ctx, progress)
 	return result, nil
 }
 func runGoPayAppChangePhone(ctx workflow.Context, activityCtx workflow.Context, jobID string) (GoPayAppStepOutput, error) {

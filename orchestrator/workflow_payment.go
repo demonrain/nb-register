@@ -9,7 +9,11 @@ import (
 )
 
 func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflowInput) (ActivateAccountWorkflowResult, error) {
+	progress := newWorkflowProgress(ctx, "ActivateAccountWorkflow", input.GetJobId())
 	result := ActivateAccountWorkflowResult{JobId: input.GetJobId()}
+	defer func() {
+		finishWorkflowProgressOnError(ctx, progress, result.GetErrorMessage())
+	}()
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(15*time.Minute))
 	gopayCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
@@ -21,6 +25,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	}
 
 	var account AccountRef
+	setWorkflowProgress(ctx, progress, "resolve_account")
 	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
 		AccountId:   input.GetAccountId(),
 		SourceJobId: input.GetSourceJobId(),
@@ -29,6 +34,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 		return result, nil
 	}
 
+	setWorkflowProgress(ctx, progress, "create_job")
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -39,6 +45,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	}
 
 	var probe ProbePlusTrialActivityOutput
+	setWorkflowProgress(ctx, progress, stepProbePlusTrial)
 	if err := workflow.ExecuteActivity(atomicCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -52,12 +59,14 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 		return failActivateWorkflow(ctx, retryCtx, result, input.GetJobId(), stepProbePlusTrial, statusFailedFinal, false, false, fmt.Errorf("account is not plus trial eligible"), map[string]any{"probe_plus_trial": protoDataMap(probe.GetData())}), nil
 	}
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppLogin)
 	logon, err := runGoPayAppAuth(ctx, gopayCtx, retryCtx, input.GetJobId())
 	if err != nil {
 		return failActivateWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppLogin, statusFailedRetryable, false, true, err, map[string]any{"probe_plus_trial": protoDataMap(probe.GetData()), "gopay_login": protoDataMap(logon.GetData())}), nil
 	}
 
 	var ensureLogon pb.EnsureLogonResponse
+	setWorkflowProgress(ctx, progress, stepEnsureLogon)
 	if err := workflow.ExecuteActivity(ensureLogonCtx, ensureLogonActivityName, &pb.EnsureLogonRequest{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -66,6 +75,7 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	}
 
 	var payment GoPayActivityOutput
+	setWorkflowProgress(ctx, progress, stepGoPayPayment)
 	payment, err = runGoPayPayment(ctx, paymentCtx, retryCtx, GoPayActivityInput{
 		JobId:             input.GetJobId(),
 		AccountId:         account.GetAccountId(),
@@ -95,10 +105,15 @@ func ActivateAccountWorkflow(ctx workflow.Context, input ActivateAccountWorkflow
 	result.Success = true
 	result.ChargeRef = payment.GetChargeRef()
 	result.SnapToken = payment.GetSnapToken()
+	setWorkflowProgressSucceeded(ctx, progress)
 	return result, nil
 }
 func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayWorkflowResult, error) {
+	progress := newWorkflowProgress(ctx, "AutoPayWorkflow", input.GetJobId())
 	result := AutoPayWorkflowResult{JobId: input.GetJobId()}
+	defer func() {
+		finishWorkflowProgressOnError(ctx, progress, result.GetErrorMessage())
+	}()
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	atomicCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(15*time.Minute))
 	gopayCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
@@ -107,6 +122,7 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 	tierCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(2*time.Minute))
 
 	var account AccountRef
+	setWorkflowProgress(ctx, progress, "resolve_account")
 	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
 		AccountId:   input.GetAccountId(),
 		SourceJobId: input.GetSourceJobId(),
@@ -115,6 +131,7 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 		return result, nil
 	}
 
+	setWorkflowProgress(ctx, progress, "create_job")
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -125,6 +142,7 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 	}
 
 	var probe ProbePlusTrialActivityOutput
+	setWorkflowProgress(ctx, progress, stepProbePlusTrial)
 	if err := workflow.ExecuteActivity(atomicCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -138,12 +156,14 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 		return failAutoPayWorkflow(ctx, retryCtx, result, input.GetJobId(), stepProbePlusTrial, statusFailedFinal, false, false, fmt.Errorf("account is not plus trial eligible"), map[string]any{"probe_plus_trial": protoDataMap(probe.GetData())}), nil
 	}
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppLogin)
 	logon, err := runGoPayAppAuth(ctx, gopayCtx, retryCtx, input.GetJobId())
 	if err != nil {
 		return failAutoPayWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppLogin, statusFailedRetryable, false, true, err, map[string]any{"probe_plus_trial": protoDataMap(probe.GetData()), "gopay_login": protoDataMap(logon.GetData())}), nil
 	}
 
 	var ensureLogon pb.EnsureLogonResponse
+	setWorkflowProgress(ctx, progress, stepEnsureLogon)
 	if err := workflow.ExecuteActivity(ensureLogonCtx, ensureLogonActivityName, &pb.EnsureLogonRequest{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -156,6 +176,7 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 	}
 
 	var payment GoPayActivityOutput
+	setWorkflowProgress(ctx, progress, stepGoPayPayment)
 	payment, err = runGoPayPayment(ctx, paymentCtx, retryCtx, GoPayActivityInput{
 		JobId:             input.GetJobId(),
 		AccountId:         account.GetAccountId(),
@@ -178,6 +199,7 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 	}
 
 	var tier ProbeTierActivityOutput
+	setWorkflowProgress(ctx, progress, stepProbeTier)
 	if err := workflow.ExecuteActivity(tierCtx, probeTierActivityName, ProbeTierActivityInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -195,15 +217,21 @@ func AutoPayWorkflow(ctx workflow.Context, input AutoPayWorkflowInput) (AutoPayW
 	result.Success = true
 	result.ChargeRef = payment.GetChargeRef()
 	result.SnapToken = payment.GetSnapToken()
+	setWorkflowProgressSucceeded(ctx, progress)
 	return result, nil
 }
 func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput) (ProbeAccountWorkflowResult, error) {
+	progress := newWorkflowProgress(ctx, "ProbeAccountWorkflow", input.GetJobId())
 	result := ProbeAccountWorkflowResult{JobId: input.GetJobId()}
+	defer func() {
+		finishWorkflowProgressOnError(ctx, progress, result.GetErrorMessage())
+	}()
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	plusTrialCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(5*time.Minute))
 	tierCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(2*time.Minute))
 
 	var account AccountRef
+	setWorkflowProgress(ctx, progress, "resolve_account")
 	if err := workflow.ExecuteActivity(retryCtx, resolveAccountActivityName, ResolveAccountInput{
 		AccountId: input.GetAccountId(),
 	}).Get(ctx, &account); err != nil {
@@ -211,6 +239,7 @@ func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput)
 		return result, nil
 	}
 
+	setWorkflowProgress(ctx, progress, "create_job")
 	if err := workflow.ExecuteActivity(retryCtx, createJobActivityName, CreateJobInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -234,6 +263,7 @@ func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput)
 		result.PlusActive = account.GetPlusActive()
 		result.PlanType = account.GetTier()
 	} else {
+		setWorkflowProgress(ctx, progress, stepProbePlusTrial)
 		if err := workflow.ExecuteActivity(plusTrialCtx, probePlusTrialActivityName, ProbePlusTrialActivityInput{
 			JobId:     input.GetJobId(),
 			AccountId: account.GetAccountId(),
@@ -254,6 +284,7 @@ func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput)
 	}
 
 	var tier ProbeTierActivityOutput
+	setWorkflowProgress(ctx, progress, stepProbeTier)
 	if err := workflow.ExecuteActivity(tierCtx, probeTierActivityName, ProbeTierActivityInput{
 		JobId:     input.GetJobId(),
 		AccountId: account.GetAccountId(),
@@ -280,6 +311,9 @@ func ProbeAccountWorkflow(ctx workflow.Context, input ProbeAccountWorkflowInput)
 		result.Source = tier.GetSource()
 	}
 	result.ErrorMessage = tier.GetErrorMessage()
+	if result.GetErrorMessage() == "" {
+		setWorkflowProgressSucceeded(ctx, progress)
+	}
 	return result, nil
 }
 func shouldSkipPlusTrialProbe(account AccountRef) bool {

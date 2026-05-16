@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 gen_go() {
   local service="$1"
   mkdir -p "${ROOT}/${service}/pb"
+  rm -f "${ROOT}/${service}/pb"/*.pb.go "${ROOT}/${service}/pb"/*_grpc.pb.go
   protoc -I "${ROOT}/${service}/proto" \
     --go_out="${ROOT}/${service}/pb" \
     --go-grpc_out="${ROOT}/${service}/pb" \
