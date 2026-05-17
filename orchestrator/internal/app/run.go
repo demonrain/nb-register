@@ -39,6 +39,7 @@ func Run() {
 		EmailClient:                          deps.emailClient,
 		GoPayClient:                          deps.gopayClient,
 		DefaultGoPayAddBalance:               defaultGoPayAddBalance(cfg),
+		DefaultGoPayAddBalances:              defaultGoPayAddBalances(cfg),
 		GoPayAddBalanceConfirmTimeoutSeconds: cfg.GoPayAddBalanceConfirmTimeoutSeconds,
 		OutlookRegisterEnableOAuth2:          cfg.OutlookRegisterEnableOAuth2,
 	})

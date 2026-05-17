@@ -1126,6 +1126,35 @@ tbody tr:hover, tr.selected { background: #f4f8ff; }
   grid-template-columns: 1fr;
 }
 
+.gopayPaymentDialog {
+  width: min(520px, calc(100vw - 28px));
+}
+
+.dialogForm {
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.dialogField {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.dialogField span {
+  color: var(--muted-foreground);
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
 .linkedWorkflowButton {
   color: var(--app-accent);
   border-color: #bfd3ff;
@@ -1940,6 +1969,15 @@ pre {
   .kv,
   .editLine {
     grid-template-columns: 72px minmax(0, 1fr) 34px;
+  }
+  .dialogField {
+    grid-template-columns: 1fr;
+  }
+  .dialogActions {
+    flex-direction: column-reverse;
+  }
+  .dialogActions button {
+    width: 100%;
   }
   .transferBox {
     grid-template-columns: 1fr;

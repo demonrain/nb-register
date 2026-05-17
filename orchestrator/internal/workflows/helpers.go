@@ -88,6 +88,9 @@ func goPayAddBalanceMethod(addBalance *GoPayAddBalance) string {
 	if addBalance.GetEnvelope() != nil {
 		return "envelope"
 	}
+	if addBalance.GetRekberinaja() != nil {
+		return "rekberinaja"
+	}
 	return ""
 }
 

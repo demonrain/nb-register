@@ -25,6 +25,7 @@ type Config struct {
 	EmailClient                          pb.EmailServiceClient
 	GoPayClient                          pb.GopayAppServiceClient
 	DefaultGoPayAddBalance               *pb.GoPayAddBalance
+	DefaultGoPayAddBalances              map[string]*pb.GoPayAddBalance
 	GoPayAddBalanceConfirmTimeoutSeconds int32
 	OutlookRegisterEnableOAuth2          bool
 }
@@ -46,6 +47,7 @@ type Server struct {
 	emailClient                          pb.EmailServiceClient
 	gopayClient                          pb.GopayAppServiceClient
 	defaultGoPayAddBalance               *pb.GoPayAddBalance
+	defaultGoPayAddBalances              map[string]*pb.GoPayAddBalance
 	goPayAddBalanceConfirmTimeoutSeconds int32
 	outlookRegisterEnableOAuth2          bool
 }
@@ -97,6 +99,7 @@ func NewServer(cfg Config) *Server {
 		emailClient:                          cfg.EmailClient,
 		gopayClient:                          cfg.GoPayClient,
 		defaultGoPayAddBalance:               cfg.DefaultGoPayAddBalance,
+		defaultGoPayAddBalances:              cloneGoPayAddBalanceMap(cfg.DefaultGoPayAddBalances),
 		goPayAddBalanceConfirmTimeoutSeconds: cfg.GoPayAddBalanceConfirmTimeoutSeconds,
 		outlookRegisterEnableOAuth2:          cfg.OutlookRegisterEnableOAuth2,
 	}

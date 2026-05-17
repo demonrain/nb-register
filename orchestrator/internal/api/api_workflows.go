@@ -173,6 +173,8 @@ func (s *Server) RunGoPayPayment(ctx context.Context, req *pb.GoPayPaymentReques
 	addBalance := cloneGoPayAddBalance(req.GetAddBalance())
 	if addBalance == nil {
 		addBalance = cloneGoPayAddBalance(s.defaultGoPayAddBalance)
+	} else {
+		addBalance = s.mergeDefaultGoPayAddBalance(addBalance)
 	}
 	addBalanceConfirmTimeoutSeconds := req.GetAddBalanceConfirmTimeoutSeconds()
 	if addBalanceConfirmTimeoutSeconds <= 0 {
@@ -253,6 +255,128 @@ func cloneGoPayAddBalance(value *pb.GoPayAddBalance) *pb.GoPayAddBalance {
 		return nil
 	}
 	return cloned
+}
+
+func cloneGoPayAddBalanceMap(values map[string]*pb.GoPayAddBalance) map[string]*pb.GoPayAddBalance {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*pb.GoPayAddBalance, len(values))
+	for key, value := range values {
+		cloned[strings.TrimSpace(key)] = cloneGoPayAddBalance(value)
+	}
+	return cloned
+}
+
+func (s *Server) mergeDefaultGoPayAddBalance(value *pb.GoPayAddBalance) *pb.GoPayAddBalance {
+	method := goPayAddBalanceMethod(value)
+	if method == "" {
+		return cloneGoPayAddBalance(value)
+	}
+	base := cloneGoPayAddBalance(s.defaultGoPayAddBalances[method])
+	if base == nil {
+		return cloneGoPayAddBalance(value)
+	}
+	mergeGoPayAddBalance(base, value)
+	return base
+}
+
+func goPayAddBalanceMethod(value *pb.GoPayAddBalance) string {
+	if value == nil {
+		return ""
+	}
+	if value.GetManualTransfer() != nil {
+		return "manual_transfer"
+	}
+	if value.GetEnvelope() != nil {
+		return "envelope"
+	}
+	if value.GetRekberinaja() != nil {
+		return "rekberinaja"
+	}
+	return ""
+}
+
+func mergeGoPayAddBalance(base *pb.GoPayAddBalance, override *pb.GoPayAddBalance) {
+	switch {
+	case base.GetManualTransfer() != nil && override.GetManualTransfer() != nil:
+		dst := base.GetManualTransfer()
+		src := override.GetManualTransfer()
+		if strings.TrimSpace(src.GetInstructions()) != "" {
+			dst.Instructions = src.GetInstructions()
+		}
+		if src.GetAmount() > 0 {
+			dst.Amount = src.GetAmount()
+		}
+		if strings.TrimSpace(src.GetCurrency()) != "" {
+			dst.Currency = src.GetCurrency()
+		}
+	case base.GetEnvelope() != nil && override.GetEnvelope() != nil:
+		dst := base.GetEnvelope()
+		src := override.GetEnvelope()
+		if strings.TrimSpace(src.GetLink()) != "" {
+			dst.Link = src.GetLink()
+		}
+		if strings.TrimSpace(src.GetEnvelopeRequestId()) != "" {
+			dst.EnvelopeRequestId = src.GetEnvelopeRequestId()
+		}
+	case base.GetRekberinaja() != nil && override.GetRekberinaja() != nil:
+		mergeRekberinajaAddBalance(base.GetRekberinaja(), override.GetRekberinaja())
+	}
+}
+
+func mergeRekberinajaAddBalance(dst *pb.GoPayRekberinajaAddBalance, src *pb.GoPayRekberinajaAddBalance) {
+	if strings.TrimSpace(src.GetEndpointUrl()) != "" {
+		dst.EndpointUrl = src.GetEndpointUrl()
+	}
+	if strings.TrimSpace(src.GetBearerToken()) != "" {
+		dst.BearerToken = src.GetBearerToken()
+	}
+	if strings.TrimSpace(src.GetRefreshToken()) != "" {
+		dst.RefreshToken = src.GetRefreshToken()
+	}
+	if strings.TrimSpace(src.GetDeviceId()) != "" {
+		dst.DeviceId = src.GetDeviceId()
+	}
+	if strings.TrimSpace(src.GetStore()) != "" {
+		dst.Store = src.GetStore()
+	}
+	if strings.TrimSpace(src.GetProductId()) != "" {
+		dst.ProductId = src.GetProductId()
+	}
+	if strings.TrimSpace(src.GetServiceId()) != "" {
+		dst.ServiceId = src.GetServiceId()
+	}
+	if strings.TrimSpace(src.GetPaymentMethod()) != "" {
+		dst.PaymentMethod = src.GetPaymentMethod()
+	}
+	if strings.TrimSpace(src.GetInvoiceEmail()) != "" {
+		dst.InvoiceEmail = src.GetInvoiceEmail()
+	}
+	if strings.TrimSpace(src.GetPromoCode()) != "" {
+		dst.PromoCode = src.GetPromoCode()
+	}
+	if src.GetUsePoin() {
+		dst.UsePoin = true
+	}
+	if strings.TrimSpace(src.GetUserAgent()) != "" {
+		dst.UserAgent = src.GetUserAgent()
+	}
+	if strings.TrimSpace(src.GetOrigin()) != "" {
+		dst.Origin = src.GetOrigin()
+	}
+	if strings.TrimSpace(src.GetReferer()) != "" {
+		dst.Referer = src.GetReferer()
+	}
+	if src.GetFeeTotal() > 0 {
+		dst.FeeTotal = src.GetFeeTotal()
+	}
+	if src.GetPollTimeoutSeconds() > 0 {
+		dst.PollTimeoutSeconds = src.GetPollTimeoutSeconds()
+	}
+	if src.GetPollIntervalSeconds() > 0 {
+		dst.PollIntervalSeconds = src.GetPollIntervalSeconds()
+	}
 }
 
 func (s *Server) RegisterAndActivateAccount(ctx context.Context, req *pb.RegisterAndActivateAccountRequest) (*pb.RegisterAndActivateAccountResponse, error) {

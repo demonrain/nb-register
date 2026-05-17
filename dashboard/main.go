@@ -23,6 +23,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"dashboard/pb"
 )
@@ -1133,7 +1135,7 @@ func (s *server) handleGoPayPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req pb.GoPayPaymentRequest
-	if err := readJSON(r, &req); err != nil {
+	if err := readProtoJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -1214,6 +1216,22 @@ func withCORS(next http.Handler) http.Handler {
 func readJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
 	return json.NewDecoder(r.Body).Decode(dst)
+}
+
+func readProtoJSON(r *http.Request, dst protojsonUnmarshaler) error {
+	defer r.Body.Close()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		raw = []byte("{}")
+	}
+	return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(raw, dst)
+}
+
+type protojsonUnmarshaler interface {
+	ProtoReflect() protoreflect.Message
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -26,6 +26,23 @@ func TestLoadOrchestratorConfigDefaults(t *testing.T) {
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_INSTRUCTIONS", "")
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_AMOUNT_RP", "")
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_CURRENCY", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_ENDPOINT_URL", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_BEARER_TOKEN", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_DEVICE_ID", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_STORE", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PRODUCT_ID", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_SERVICE_ID", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PAYMENT_METHOD", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_INVOICE_EMAIL", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PROMO_CODE", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_USE_POIN", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_USER_AGENT", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_ORIGIN", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_REFERER", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_REFRESH_TOKEN", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_FEE_TOTAL_RP", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_POLL_TIMEOUT_SECONDS", "")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_POLL_INTERVAL_SECONDS", "")
 	t.Setenv("GOPAY_ADD_BALANCE_CONFIRM_TIMEOUT_SECONDS", "")
 	t.Setenv("OUTLOOK_REGISTER_ENABLE_OAUTH2", "")
 	t.Setenv("GOPAY_CHANGE_PHONE_DISABLED", "")
@@ -85,6 +102,23 @@ func TestLoadOrchestratorConfigDefaults(t *testing.T) {
 		cfg.GoPayAddBalanceTransferInstructions != "" ||
 		cfg.GoPayAddBalanceTransferAmountRp != 1 ||
 		cfg.GoPayAddBalanceTransferCurrency != "IDR" ||
+		cfg.GoPayAddBalanceRekberinajaEndpoint != "https://api.rekberinaja.com/api/transaction/product/checkout" ||
+		cfg.GoPayAddBalanceRekberinajaToken != "" ||
+		cfg.GoPayAddBalanceRekberinajaDeviceID != "" ||
+		cfg.GoPayAddBalanceRekberinajaStore != "rekberinaja" ||
+		cfg.GoPayAddBalanceRekberinajaProductID != "" ||
+		cfg.GoPayAddBalanceRekberinajaServiceID != "" ||
+		cfg.GoPayAddBalanceRekberinajaPayment != "saldo" ||
+		cfg.GoPayAddBalanceRekberinajaEmail != "" ||
+		cfg.GoPayAddBalanceRekberinajaPromoCode != "" ||
+		cfg.GoPayAddBalanceRekberinajaUsePoin ||
+		cfg.GoPayAddBalanceRekberinajaOrigin != "https://rekberinaja.com" ||
+		cfg.GoPayAddBalanceRekberinajaReferer != "https://rekberinaja.com/" ||
+		cfg.GoPayAddBalanceRekberinajaRefresh != "" ||
+		cfg.GoPayAddBalanceRekberinajaFeeTotal != 1300 ||
+		cfg.GoPayAddBalanceRekberinajaPollTimeout != 180 ||
+		cfg.GoPayAddBalanceRekberinajaPollInterval != 5 ||
+		cfg.GoPayAddBalanceRekberinajaUserAgent == "" ||
 		cfg.GoPayAddBalanceConfirmTimeoutSeconds != 1800 {
 		t.Fatalf("gopay add balance defaults = %+v", cfg)
 	}
@@ -149,6 +183,23 @@ func TestLoadOrchestratorConfigOverrides(t *testing.T) {
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_INSTRUCTIONS", "transfer then confirm")
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_AMOUNT_RP", "2000")
 	t.Setenv("GOPAY_ADD_BALANCE_TRANSFER_CURRENCY", "IDR")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_ENDPOINT_URL", "https://example.invalid/checkout")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_BEARER_TOKEN", "token")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_DEVICE_ID", "device")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_STORE", "store")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PRODUCT_ID", "product")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_SERVICE_ID", "service")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PAYMENT_METHOD", "saldo")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_INVOICE_EMAIL", "invoice@example.invalid")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_PROMO_CODE", "promo")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_USE_POIN", "true")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_USER_AGENT", "agent")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_ORIGIN", "https://origin.example.invalid")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_REFERER", "https://referer.example.invalid/")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_REFRESH_TOKEN", "refresh")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_FEE_TOTAL_RP", "1400")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_POLL_TIMEOUT_SECONDS", "90")
+	t.Setenv("GOPAY_ADD_BALANCE_REKBERINAJA_POLL_INTERVAL_SECONDS", "3")
 	t.Setenv("GOPAY_ADD_BALANCE_CONFIRM_TIMEOUT_SECONDS", "901")
 	t.Setenv("OUTLOOK_REGISTER_ENABLE_OAUTH2", "false")
 	t.Setenv("GOPAY_CHANGE_PHONE_DISABLED", "yes")
@@ -202,6 +253,23 @@ func TestLoadOrchestratorConfigOverrides(t *testing.T) {
 		cfg.GoPayAddBalanceTransferInstructions != "transfer then confirm" ||
 		cfg.GoPayAddBalanceTransferAmountRp != 2000 ||
 		cfg.GoPayAddBalanceTransferCurrency != "IDR" ||
+		cfg.GoPayAddBalanceRekberinajaEndpoint != "https://example.invalid/checkout" ||
+		cfg.GoPayAddBalanceRekberinajaToken != "token" ||
+		cfg.GoPayAddBalanceRekberinajaDeviceID != "device" ||
+		cfg.GoPayAddBalanceRekberinajaStore != "store" ||
+		cfg.GoPayAddBalanceRekberinajaProductID != "product" ||
+		cfg.GoPayAddBalanceRekberinajaServiceID != "service" ||
+		cfg.GoPayAddBalanceRekberinajaPayment != "saldo" ||
+		cfg.GoPayAddBalanceRekberinajaEmail != "invoice@example.invalid" ||
+		cfg.GoPayAddBalanceRekberinajaPromoCode != "promo" ||
+		!cfg.GoPayAddBalanceRekberinajaUsePoin ||
+		cfg.GoPayAddBalanceRekberinajaUserAgent != "agent" ||
+		cfg.GoPayAddBalanceRekberinajaOrigin != "https://origin.example.invalid" ||
+		cfg.GoPayAddBalanceRekberinajaReferer != "https://referer.example.invalid/" ||
+		cfg.GoPayAddBalanceRekberinajaRefresh != "refresh" ||
+		cfg.GoPayAddBalanceRekberinajaFeeTotal != 1400 ||
+		cfg.GoPayAddBalanceRekberinajaPollTimeout != 90 ||
+		cfg.GoPayAddBalanceRekberinajaPollInterval != 3 ||
 		cfg.GoPayAddBalanceConfirmTimeoutSeconds != 901 {
 		t.Fatalf("gopay add balance config not overridden: %+v", cfg)
 	}

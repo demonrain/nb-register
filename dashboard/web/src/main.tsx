@@ -186,7 +186,8 @@ type AccountMailboxContext = {
   known: boolean;
 };
 
-type GoPayOTPChannel = 'sms' | 'wa';
+type GoPayOTPChannel = '' | 'sms' | 'wa';
+type GoPayAddBalanceMethod = 'manual_transfer' | 'envelope' | 'rekberinaja';
 
 type Toast = { kind: 'ok' | 'error'; text: string } | null;
 type ViewKey = 'accounts' | 'gopay' | 'mailboxes' | 'jobs';
@@ -314,6 +315,9 @@ function App() {
   const [toast, setToast] = useState<Toast>(null);
   const [showSecrets, setShowSecrets] = useState(false);
   const [gopayWaPhone, setGopayWaPhone] = useState('');
+  const [gopayPaymentAccount, setGopayPaymentAccount] = useState<Account | null>(null);
+  const [gopayPaymentChannel, setGopayPaymentChannel] = useState<GoPayOTPChannel>('');
+  const [gopayPaymentAddBalance, setGopayPaymentAddBalance] = useState<GoPayAddBalanceMethod>('manual_transfer');
   const [mailboxRegistering, setMailboxRegistering] = useState(false);
   const [mailboxOAuthing, setMailboxOAuthing] = useState('');
   const [inboxLoading, setInboxLoading] = useState(false);
@@ -433,14 +437,34 @@ function App() {
     }
   }
 
-  async function runGoPayPayment(account: Account, otpChannel: GoPayOTPChannel) {
+  function openGoPayPayment(account: Account) {
+    const stored = activationChannelSelectValue(account.activation_channel || '');
+    const normalizedChannel = normalizeActivationChannel(stored || account.activation_channel || '');
+    const channel: GoPayOTPChannel = normalizedChannel === 'WA' ? 'wa' : normalizedChannel === 'SMS' ? 'sms' : '';
+    const storedMethod = addBalanceMethodValue(stored || account.activation_channel || '');
+    const method: GoPayAddBalanceMethod = storedMethod === 'rekberinaja' || storedMethod === 'envelope' ? storedMethod : 'manual_transfer';
+    setGopayPaymentAccount(account);
+    setGopayPaymentChannel(channel);
+    setGopayPaymentAddBalance(method);
+  }
+
+  async function submitGoPayPayment() {
+    if (!gopayPaymentAccount) return;
+    await runGoPayPayment(gopayPaymentAccount, gopayPaymentChannel, gopayPaymentAddBalance);
+    setGopayPaymentAccount(null);
+  }
+
+  async function runGoPayPayment(account: Account, otpChannel: GoPayOTPChannel, addBalanceMethod: GoPayAddBalanceMethod) {
     setBusy(true);
     try {
-      const payload: Record<string, string> = {
+      const payload: Record<string, any> = {
         account_id: account.account_id,
-        otp_channel: otpChannel,
-        state_key: 'local'
+        state_key: 'local',
+        add_balance: goPayAddBalancePayload(addBalanceMethod)
       };
+      if (otpChannel) {
+        payload.otp_channel = otpChannel;
+      }
       if (otpChannel === 'wa' && gopayWaPhone.trim()) {
         payload.wa_phone = gopayWaPhone.trim();
       }
@@ -451,7 +475,7 @@ function App() {
       if (resp.error_message) {
         setToast({ kind: 'error', text: resp.error_message });
       } else {
-        setToast({ kind: 'ok', text: `Gopay-${otpChannel.toUpperCase()}-手动转账支付已提交: ${resp.job_id || 'ok'}` });
+        setToast({ kind: 'ok', text: `Gopay-${addBalanceMethodLabel(addBalanceMethod)}支付已提交: ${resp.job_id || 'ok'}` });
         await refresh();
       }
     } catch (err) {
@@ -873,7 +897,7 @@ function App() {
                   onOpenWorkflow={selectJob}
                   onRegister={(account) => runAccountWorkflow('注册账号', '/api/workflows/register', account)}
                   onLogin={(account) => runAccountWorkflow(loginActionLabel(account), '/api/workflows/login', account)}
-	                  onGoPayPayment={runGoPayPayment}
+	                  onGoPayPayment={openGoPayPayment}
 	                  onProbeAccount={(account) => runAccountWorkflow('探测账号', '/api/workflows/probe', account)}
                   onRegisterActivate={(account) => runAccountWorkflow('注册并激活', '/api/workflows/register-and-activate', account)}
                   onRefreshAccessToken={refreshAccountAccessToken}
@@ -1011,7 +1035,7 @@ function App() {
             onFetchInbox={fetchMailboxInbox}
             onSessionSave={(account, sessionToken) => updateAccount(account, { session_token: sessionToken }, '认证信息已更新')}
             onAccessSave={(account, accessToken) => updateAccount(account, { access_token: accessToken }, '认证信息已更新')}
-            onActivationChannelSave={(account, activationChannel) => updateAccount(account, { activation_channel: activationChannel }, '激活渠道已更新')}
+            onActivationChannelSave={(account, activationChannel) => updateAccount(account, { activation_channel: activationChannel }, '加余额渠道已更新')}
 	            onProbeAccount={(account) => runAccountWorkflow('探测账号', '/api/workflows/probe', account)}
 	            onLogin={(account) => runAccountWorkflow(loginActionLabel(account), '/api/workflows/login', account)}
             onRefreshAccessToken={refreshAccountAccessToken}
@@ -1034,6 +1058,19 @@ function App() {
 	          />
         )}
       </WorkflowDialog>
+
+      <GoPayPaymentDialog
+        account={gopayPaymentAccount}
+        channel={gopayPaymentChannel}
+        addBalanceMethod={gopayPaymentAddBalance}
+        waPhone={gopayWaPhone}
+        busy={busy}
+        onChannelChange={setGopayPaymentChannel}
+        onAddBalanceMethodChange={setGopayPaymentAddBalance}
+        onWaPhoneChange={setGopayWaPhone}
+        onSubmit={() => void submitGoPayPayment()}
+        onClose={() => setGopayPaymentAccount(null)}
+      />
 
       <DetailDrawer open={!!selectedMailbox} title="邮箱详情" onClose={closeDetails}>
         {selectedMailbox && (
@@ -1193,6 +1230,71 @@ function WorkflowDialog({ open, onClose, children }: {
           </div>
           <div className="workflowDialogBody">
             {children}
+          </div>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  );
+}
+
+function GoPayPaymentDialog({ account, channel, addBalanceMethod, waPhone, busy, onChannelChange, onAddBalanceMethodChange, onWaPhoneChange, onSubmit, onClose }: {
+  account: Account | null;
+  channel: GoPayOTPChannel;
+  addBalanceMethod: GoPayAddBalanceMethod;
+  waPhone: string;
+  busy: boolean;
+  onChannelChange: (channel: GoPayOTPChannel) => void;
+  onAddBalanceMethodChange: (method: GoPayAddBalanceMethod) => void;
+  onWaPhoneChange: (value: string) => void;
+  onSubmit: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <DialogPrimitive.Root open={!!account} onOpenChange={(nextOpen) => {
+      if (!nextOpen) onClose();
+    }}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="workflowDialogOverlay" />
+        <DialogPrimitive.Content className="workflowDialogContent gopayPaymentDialog">
+          <div className="workflowDialogHeader">
+            <DialogPrimitive.Title className="drawerTitle"><WalletCards size={16} />GoPay 支付</DialogPrimitive.Title>
+            <DialogPrimitive.Description className="sr-only">选择 GoPay 加余额渠道</DialogPrimitive.Description>
+            <DialogPrimitive.Close asChild>
+              <Button className="iconButton" {...buttonHint('关闭 GoPay 支付')}>
+                <X size={16} />
+              </Button>
+            </DialogPrimitive.Close>
+          </div>
+          <div className="dialogForm">
+            <KV label="账号" value={account?.email || account?.account_id || '-'} />
+            <label className="dialogField">
+              <span>编排渠道</span>
+              <NativeSelect value={channel} onChange={(event) => onChannelChange(event.target.value as GoPayOTPChannel)}>
+                <NativeSelectOption value="">不指定</NativeSelectOption>
+                <NativeSelectOption value="sms">SMS</NativeSelectOption>
+                <NativeSelectOption value="wa">WA</NativeSelectOption>
+              </NativeSelect>
+            </label>
+            {channel === 'wa' && (
+              <label className="dialogField">
+                <span>WA 手机号</span>
+                <Input placeholder="WA 手机号，可空" value={waPhone} onChange={(event) => onWaPhoneChange(event.target.value)} />
+              </label>
+            )}
+            <label className="dialogField">
+              <span>加余额渠道</span>
+              <NativeSelect value={addBalanceMethod} onChange={(event) => onAddBalanceMethodChange(event.target.value as GoPayAddBalanceMethod)}>
+                <NativeSelectOption value="manual_transfer">手动转账</NativeSelectOption>
+                <NativeSelectOption value="envelope">红包</NativeSelectOption>
+                <NativeSelectOption value="rekberinaja">R平台</NativeSelectOption>
+              </NativeSelect>
+            </label>
+            <div className="dialogActions">
+              <Button className="secondaryButton" onClick={onClose} disabled={busy}>取消</Button>
+              <Button className="primaryButton" onClick={onSubmit} disabled={busy || !account}>
+                <WalletCards size={14} /> 启动支付
+              </Button>
+            </div>
           </div>
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
@@ -1558,7 +1660,7 @@ function AccountTable({ accounts, jobs, selected, showSecrets, runningAccountIds
   onOpenWorkflow: (job: Job) => void;
   onRegister: (a: Account) => void;
   onLogin: (a: Account) => void;
-  onGoPayPayment: (a: Account, otpChannel: GoPayOTPChannel) => void;
+  onGoPayPayment: (a: Account) => void;
   onProbeAccount: (a: Account) => void;
   onRegisterActivate: (a: Account) => void;
   onRefreshAccessToken: (a: Account) => Promise<void>;
@@ -1574,7 +1676,7 @@ function AccountTable({ accounts, jobs, selected, showSecrets, runningAccountIds
             <TableHead>状态</TableHead>
             <TableHead>Tier</TableHead>
             <TableHead>Plus资格</TableHead>
-            <TableHead>激活渠道</TableHead>
+            <TableHead>加余额</TableHead>
             <TableHead>更新</TableHead>
             <TableHead>操作</TableHead>
           </TableRow>
@@ -1601,7 +1703,7 @@ function AccountTable({ accounts, jobs, selected, showSecrets, runningAccountIds
                 </TableCell>
                 <TableCell data-label="Tier"><TierBadge tier={account.tier} /></TableCell>
                 <TableCell data-label="Plus资格"><PlusBadge account={account} /></TableCell>
-                <TableCell data-label="激活渠道">
+                <TableCell data-label="加余额">
                   <span className="activationChannel">{accountActivationChannel(account, jobs)}</span>
                 </TableCell>
                 <TableCell data-label="更新">{formatUnix(account.updated_at)}</TableCell>
@@ -1640,7 +1742,7 @@ function AccountRowActions({ account, accountBusy, currentWorkflow, busy, refres
   onOpenWorkflow: (job: Job) => void;
   onRegister: (a: Account) => void;
   onLogin: (a: Account) => void;
-  onGoPayPayment: (a: Account, otpChannel: GoPayOTPChannel) => void;
+  onGoPayPayment: (a: Account) => void;
   onProbeAccount: (a: Account) => void;
   onRegisterActivate: (a: Account) => void;
   onRefreshAccessToken: (a: Account) => Promise<void>;
@@ -1663,8 +1765,7 @@ function AccountRowActions({ account, accountBusy, currentWorkflow, busy, refres
   actions.push({ label: '删除账号', icon: <Trash2 size={14} />, onClick: () => onDelete(account), disabled: busy, kind: 'danger' });
 
   const paymentActions: RowActionDescriptor[] = canGoPayPayment(account) ? [
-    { label: 'Gopay-SMS-手动转账支付', icon: <WalletCards size={14} />, onClick: () => onGoPayPayment(account, 'sms'), disabled: busy, kind: 'secondary' },
-    { label: 'Gopay-WA-手动转账支付', icon: <WalletCards size={14} />, onClick: () => onGoPayPayment(account, 'wa'), disabled: busy, kind: 'secondary' }
+    { label: 'Gopay支付', icon: <WalletCards size={14} />, onClick: () => onGoPayPayment(account), disabled: busy, kind: 'secondary' }
   ] : [];
 
   const primary = actions.find((action) => action.kind === 'primary' && !action.disabled) ||
@@ -2277,13 +2378,14 @@ function ActivationChannelEditor({ account, activationChannel, onSave }: {
 
   return (
     <div className="editLine channelEditLine">
-      <span>激活渠道</span>
+      <span>加余额渠道</span>
       <NativeSelect value={value} onChange={(event) => setValue(event.target.value)}>
         <NativeSelectOption value="">未设置</NativeSelectOption>
-        <NativeSelectOption value="gopay_sms_manual_transfer">Gopay-SMS-手动转账</NativeSelectOption>
-        <NativeSelectOption value="gopay_wa_manual_transfer">Gopay-WA-手动转账</NativeSelectOption>
+        <NativeSelectOption value="manual_transfer">手动转账</NativeSelectOption>
+        <NativeSelectOption value="envelope">红包</NativeSelectOption>
+        <NativeSelectOption value="rekberinaja">R平台</NativeSelectOption>
       </NativeSelect>
-      <Button {...buttonHint('保存激活渠道')} onClick={save} disabled={saving || value === stored}>
+      <Button {...buttonHint('保存加余额渠道')} onClick={save} disabled={saving || value === stored}>
         <Save size={14} /> 保存
       </Button>
     </div>
@@ -2435,28 +2537,22 @@ function accountActivationChannel(account: Account, jobs: Job[]) {
 
   const result = objectValue(latestPaymentJob.result);
   const addBalance = objectValue(result.add_balance);
-  const payment = objectValue(result.gopay_payment);
-  const paymentStep = objectValue(stepResultData(latestPaymentJob, 'gopay_payment'));
-  return formatActivationChannel(
-    stringValue(result.otp_channel) || stringValue(payment.otp_channel) || stringValue(paymentStep.otp_channel),
-    stringValue(result.add_balance_method) || stringValue(addBalance.method)
-  );
+  return formatActivationChannel('', stringValue(result.add_balance_method) || stringValue(addBalance.method));
 }
 
 function formatActivationChannel(channel: string, addBalanceMethod: string) {
-  const normalizedChannel = normalizeActivationChannel(channel);
-  const manualTransfer = isManualTransferActivation(channel) || isManualTransferActivation(addBalanceMethod);
-  if (normalizedChannel) {
-    return manualTransfer ? `Gopay-${normalizedChannel}-手动转账` : `Gopay-${normalizedChannel}`;
-  }
-  return manualTransfer ? 'Gopay-手动转账' : '-';
+  const methodLabel = addBalanceMethodLabel(addBalanceMethod) || addBalanceMethodLabel(channel);
+  return methodLabel || '-';
 }
 
 function activationChannelSelectValue(value: string) {
-  const normalizedChannel = normalizeActivationChannel(value);
-  if (normalizedChannel === 'SMS') return 'gopay_sms_manual_transfer';
-  if (normalizedChannel === 'WA') return 'gopay_wa_manual_transfer';
-  return '';
+  return addBalanceMethodValue(value);
+}
+
+function goPayAddBalancePayload(method: GoPayAddBalanceMethod) {
+  if (method === 'rekberinaja') return { rekberinaja: {} };
+  if (method === 'envelope') return { envelope: {} };
+  return { manual_transfer: {} };
 }
 
 function normalizeActivationChannel(value: string) {
@@ -2470,6 +2566,31 @@ function normalizeActivationChannel(value: string) {
 function isManualTransferActivation(value: string) {
   const normalized = String(value || '').trim().toLowerCase();
   return normalized === 'manual_transfer' || normalized === 'manual-transfer' || normalized.includes('manual_transfer') || normalized.includes('手动转账');
+}
+
+function isRekberinajaActivation(value: string) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'rekberinaja' || normalized === 'r_platform' || normalized.includes('rekberinaja') || normalized.includes('r平台');
+}
+
+function isEnvelopeActivation(value: string) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'envelope' || normalized === 'claim_envelope' || normalized.includes('envelope') || normalized.includes('红包');
+}
+
+function addBalanceMethodValue(value: string) {
+  if (isRekberinajaActivation(value)) return 'rekberinaja';
+  if (isEnvelopeActivation(value)) return 'envelope';
+  if (isManualTransferActivation(value)) return 'manual_transfer';
+  return '';
+}
+
+function addBalanceMethodLabel(value: string) {
+  const method = addBalanceMethodValue(value);
+  if (method === 'rekberinaja') return 'R平台';
+  if (method === 'envelope') return '红包';
+  if (method === 'manual_transfer') return '手动转账';
+  return '';
 }
 
 function canProbeAccount(account: Account) {

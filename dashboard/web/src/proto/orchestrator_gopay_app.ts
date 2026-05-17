@@ -82,6 +82,7 @@ export interface GoPayPaymentRebindRequest {
 export interface GoPayAddBalance {
   envelope?: GoPayEnvelopeAddBalance | undefined;
   manual_transfer?: GoPayManualTransferAddBalance | undefined;
+  rekberinaja?: GoPayRekberinajaAddBalance | undefined;
 }
 
 export interface GoPayEnvelopeAddBalance {
@@ -93,6 +94,26 @@ export interface GoPayManualTransferAddBalance {
   instructions: string;
   amount: number;
   currency: string;
+}
+
+export interface GoPayRekberinajaAddBalance {
+  endpoint_url: string;
+  bearer_token: string;
+  device_id: string;
+  store: string;
+  product_id: string;
+  service_id: string;
+  payment_method: string;
+  invoice_email: string;
+  promo_code: string;
+  use_poin: boolean;
+  user_agent: string;
+  origin: string;
+  referer: string;
+  refresh_token: string;
+  fee_total: number;
+  poll_timeout_seconds: number;
+  poll_interval_seconds: number;
 }
 
 export interface ManualAddBalanceSignal {
@@ -440,6 +461,7 @@ export interface GoPayAppAddBalanceInput {
   job_id: string;
   state_json: string;
   add_balance: GoPayAddBalance | undefined;
+  target_phone: string;
 }
 
 export interface GoPayAppAddBalanceOutput {

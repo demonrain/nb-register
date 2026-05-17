@@ -60,12 +60,23 @@ type GoPayUserProfile struct {
 	UpdatedAt int64  `gorm:"autoUpdateTime"`
 }
 
+type RuntimeSecret struct {
+	Key       string `gorm:"primaryKey;column:key"`
+	Value     string `gorm:"column:value"`
+	CreatedAt int64  `gorm:"autoCreateTime"`
+	UpdatedAt int64  `gorm:"autoUpdateTime"`
+}
+
 func (JobEvent) TableName() string {
 	return "job_events"
 }
 
 func (GoPayUserProfile) TableName() string {
 	return "gopay_user_profiles"
+}
+
+func (RuntimeSecret) TableName() string {
+	return "runtime_secrets"
 }
 
 func DSN() string {
@@ -86,6 +97,6 @@ func InitDB() *gorm.DB {
 	if err != nil {
 		log.Fatalf("failed to connect to PostgreSQL database: %v", err)
 	}
-	db.AutoMigrate(&Job{}, &JobParam{}, &JobStep{}, &JobEvent{}, &GoPayUserProfile{})
+	db.AutoMigrate(&Job{}, &JobParam{}, &JobStep{}, &JobEvent{}, &GoPayUserProfile{}, &RuntimeSecret{})
 	return db
 }

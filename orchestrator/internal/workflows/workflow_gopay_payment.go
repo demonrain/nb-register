@@ -176,9 +176,10 @@ func goPaySMSPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInp
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
 	if err := workflow.ExecuteActivity(addBalanceCtx, goPayAppAddBalanceActivityName, GoPayAppAddBalanceInput{
-		JobId:      input.GetJobId(),
-		StateJson:  stateJSON,
-		AddBalance: addBalance,
+		JobId:       input.GetJobId(),
+		StateJson:   stateJSON,
+		AddBalance:  addBalance,
+		TargetPhone: result.GetPhone(),
 	}).Get(ctx, &balance); err != nil {
 		stateJSON = balance.GetStateJson()
 		combined["add_balance"] = protoDataMap(balance.GetData())
@@ -414,9 +415,10 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
 	if err := workflow.ExecuteActivity(addBalanceCtx, goPayAppAddBalanceActivityName, GoPayAppAddBalanceInput{
-		JobId:      input.GetJobId(),
-		StateJson:  stateJSON,
-		AddBalance: addBalance,
+		JobId:       input.GetJobId(),
+		StateJson:   stateJSON,
+		AddBalance:  addBalance,
+		TargetPhone: result.GetWaPhone(),
 	}).Get(ctx, &balance); err != nil {
 		stateJSON = balance.GetStateJson()
 		combined["add_balance"] = protoDataMap(balance.GetData())
