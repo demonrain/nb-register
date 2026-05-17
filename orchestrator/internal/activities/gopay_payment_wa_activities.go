@@ -13,12 +13,12 @@ import (
 )
 
 func (s *Server) GoPayResolveWAPhoneActivity(ctx context.Context, input GoPayResolveWAPhoneInput) (GoPayResolveWAPhoneOutput, error) {
-	stateKey, err := normalizeGoPayStateKey(input.GetStateKey())
+	userID, err := normalizeGoPayUserID(input.GetUserId())
 	if err != nil {
 		return GoPayResolveWAPhoneOutput{}, err
 	}
-	output := GoPayResolveWAPhoneOutput{StateKey: stateKey}
-	data := map[string]any{"state_key": stateKey}
+	output := GoPayResolveWAPhoneOutput{UserId: userID}
+	data := map[string]any{"user_id": userID}
 	step := s.activityStep(ctx, input.GetJobId(), stepGoPayAppWAPhoneCheck, false, true)
 	_, err = step.run(func() (any, error) {
 		if s.db == nil {
@@ -35,7 +35,7 @@ func (s *Server) GoPayResolveWAPhoneActivity(ctx context.Context, input GoPayRes
 		phone := normalizeIndonesiaPhone(input.GetWaPhone())
 		data["request_phone_present"] = phone != ""
 		if phone == "" {
-			stored, err := s.loadGoPayWAPhoneProfile(ctx, stateKey)
+			stored, err := s.loadGoPayWAPhoneProfile(ctx, userID)
 			if err != nil {
 				data["profile_error"] = err.Error()
 				return data, err
@@ -43,7 +43,7 @@ func (s *Server) GoPayResolveWAPhoneActivity(ctx context.Context, input GoPayRes
 			phone = stored
 			data["profile_phone_present"] = phone != ""
 		}
-		if phone == "" && stateKey == goPayLocalSource {
+		if phone == "" && userID == goPayLocalSource {
 			phone = configuredGoPayWAPhone()
 			data["env_phone_present"] = phone != ""
 		}
@@ -73,7 +73,7 @@ func (s *Server) GoPayResolveWAPhoneActivity(ctx context.Context, input GoPayRes
 			data["error_message"] = err.Error()
 			return data, err
 		}
-		if err := s.saveGoPayWAPhoneProfile(ctx, stateKey, phone); err != nil {
+		if err := s.saveGoPayWAPhoneProfile(ctx, userID, phone); err != nil {
 			data["profile_error"] = err.Error()
 			return data, err
 		}
@@ -103,13 +103,13 @@ func goPayWAPhoneCheckError(status, message string) error {
 }
 
 func (s *Server) GoPayAppLoadStateActivity(ctx context.Context, input GoPayAppStateActivityInput) (GoPayAppStateActivityOutput, error) {
-	stateKey, err := normalizeGoPayStateKey(input.GetStateKey())
+	userID, err := normalizeGoPayUserID(input.GetUserId())
 	if err != nil {
 		return GoPayAppStateActivityOutput{}, err
 	}
-	output := GoPayAppStateActivityOutput{StateKey: stateKey}
-	data := map[string]any{"state_key": stateKey, "reason": input.GetReason()}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	output := GoPayAppStateActivityOutput{UserId: userID}
+	data := map[string]any{"user_id": userID, "reason": input.GetReason()}
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, userID)
 	if err != nil {
 		data["error_message"] = err.Error()
 		output.Data = protoData(data)
@@ -122,23 +122,43 @@ func (s *Server) GoPayAppLoadStateActivity(ctx context.Context, input GoPayAppSt
 }
 
 func (s *Server) GoPayAppSaveStateActivity(ctx context.Context, input GoPayAppStateActivityInput) (GoPayAppStateActivityOutput, error) {
-	stateKey, err := normalizeGoPayStateKey(input.GetStateKey())
+	userID, err := normalizeGoPayUserID(input.GetUserId())
 	if err != nil {
 		return GoPayAppStateActivityOutput{}, err
 	}
 	stateJSON := normalizeGoPayWorkflowStateJSON(input.GetStateJson())
-	output := GoPayAppStateActivityOutput{StateKey: stateKey, StateJson: stateJSON}
+	output := GoPayAppStateActivityOutput{UserId: userID, StateJson: stateJSON}
 	data := map[string]any{
-		"state_key":     stateKey,
+		"user_id":       userID,
 		"reason":        input.GetReason(),
 		"state_present": strings.TrimSpace(stateJSON) != "",
 	}
-	if err := s.saveGoPayAppStateForKey(ctx, stateKey, stateJSON); err != nil {
+	if err := s.saveGoPayAppStateForUser(ctx, userID, stateJSON); err != nil {
 		data["error_message"] = err.Error()
 		output.Data = protoData(data)
 		return output, err
 	}
 	data["saved"] = true
+	output.Data = protoData(data)
+	return output, nil
+}
+
+func (s *Server) GoPayAppDeleteStateActivity(ctx context.Context, input GoPayAppStateActivityInput) (GoPayAppStateActivityOutput, error) {
+	userID, err := normalizeGoPayUserID(input.GetUserId())
+	if err != nil {
+		return GoPayAppStateActivityOutput{}, err
+	}
+	output := GoPayAppStateActivityOutput{UserId: userID}
+	data := map[string]any{
+		"user_id": userID,
+		"reason":  input.GetReason(),
+	}
+	if err := s.deleteGoPayAppStateForUser(ctx, userID); err != nil {
+		data["error_message"] = err.Error()
+		output.Data = protoData(data)
+		return output, err
+	}
+	data["deleted"] = true
 	output.Data = protoData(data)
 	return output, nil
 }
@@ -170,8 +190,8 @@ func (s *Server) GoPayPaymentRebindSourceActivity(ctx context.Context, input GoP
 		_ = json.Unmarshal([]byte(sourceJob.ResultJSON), &result)
 	}
 	accountID := firstNonEmpty(input.GetAccountId(), sourceJob.AccountID, stringField(result, "account_id"))
-	stateKey := firstNonEmpty(input.GetStateKey(), jobParam(ctx, s, output.GetSourceJobId(), "state_key"), stringField(result, "state_key"))
-	stateKey, err = normalizeGoPayStateKey(stateKey)
+	userID := firstNonEmpty(input.GetUserId(), jobParam(ctx, s, output.GetSourceJobId(), "user_id"), stringField(result, "user_id"))
+	userID, err = normalizeGoPayUserID(userID)
 	if err != nil {
 		data["error_message"] = err.Error()
 		output.Data = protoData(data)
@@ -179,7 +199,13 @@ func (s *Server) GoPayPaymentRebindSourceActivity(ctx context.Context, input GoP
 	}
 	waPhone := firstNonEmpty(jobParam(ctx, s, output.GetSourceJobId(), "wa_phone"), stringField(result, "wa_phone"))
 	if waPhone == "" {
-		waPhone, _ = s.loadGoPayWAPhoneProfile(ctx, stateKey)
+		waPhone, _ = s.loadGoPayWAPhoneProfile(ctx, userID)
+	}
+	if waPhone == "" {
+		err := fmt.Errorf("source job wa_phone is required for GoPay WA rebind")
+		data["error_message"] = err.Error()
+		output.Data = protoData(data)
+		return output, err
 	}
 	chargeRef := firstNonEmpty(stringField(result, "charge_ref"), nestedStringField(result, "gopay_payment", "charge_ref"), nestedStringField(result, "payment", "charge_ref"))
 	snapToken := firstNonEmpty(stringField(result, "snap_token"), nestedStringField(result, "gopay_payment", "snap_token"), nestedStringField(result, "payment", "snap_token"))
@@ -191,12 +217,12 @@ func (s *Server) GoPayPaymentRebindSourceActivity(ctx context.Context, input GoP
 	}
 
 	output.AccountId = accountID
-	output.StateKey = stateKey
+	output.UserId = userID
 	output.WaPhone = waPhone
 	output.ChargeRef = chargeRef
 	output.SnapToken = snapToken
 	data["account_id"] = accountID
-	data["state_key"] = stateKey
+	data["user_id"] = userID
 	data["wa_phone_present"] = waPhone != ""
 	data["charge_ref_present"] = chargeRef != ""
 	data["snap_token_present"] = snapToken != ""
@@ -204,12 +230,12 @@ func (s *Server) GoPayPaymentRebindSourceActivity(ctx context.Context, input GoP
 	return output, nil
 }
 
-func (s *Server) loadGoPayWAPhoneProfile(ctx context.Context, stateKey string) (string, error) {
+func (s *Server) loadGoPayWAPhoneProfile(ctx context.Context, userID string) (string, error) {
 	if s.db == nil {
 		return "", fmt.Errorf("orchestrator db not configured")
 	}
 	var profile db.GoPayUserProfile
-	result := s.db.WithContext(ctx).Where("state_key = ?", stateKey).Limit(1).Find(&profile)
+	result := s.db.WithContext(ctx).Where("state_key = ?", userID).Limit(1).Find(&profile)
 	if result.Error != nil {
 		return "", result.Error
 	}
@@ -219,7 +245,7 @@ func (s *Server) loadGoPayWAPhoneProfile(ctx context.Context, stateKey string) (
 	return normalizeIndonesiaPhone(profile.WAPhone), nil
 }
 
-func (s *Server) saveGoPayWAPhoneProfile(ctx context.Context, stateKey, phone string) error {
+func (s *Server) saveGoPayWAPhoneProfile(ctx context.Context, userID, phone string) error {
 	if s.db == nil {
 		return fmt.Errorf("orchestrator db not configured")
 	}
@@ -230,30 +256,7 @@ func (s *Server) saveGoPayWAPhoneProfile(ctx context.Context, stateKey, phone st
 	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "state_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"wa_phone", "updated_at"}),
-	}).Create(&db.GoPayUserProfile{StateKey: stateKey, WAPhone: phone}).Error
-}
-
-func normalizeGoPayStateKey(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" || value == goPayLocalSource {
-		return goPayLocalSource, nil
-	}
-	if strings.HasPrefix(value, "tg:") && digitsOnly(strings.TrimSpace(strings.TrimPrefix(value, "tg:"))) {
-		return "tg:" + strings.TrimSpace(strings.TrimPrefix(value, "tg:")), nil
-	}
-	return "", fmt.Errorf("state_key must be local or tg:<user_id>")
-}
-
-func digitsOnly(value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	}).Create(&db.GoPayUserProfile{StateKey: userID, WAPhone: phone}).Error
 }
 
 func jobParam(ctx context.Context, s *Server, jobID, key string) string {

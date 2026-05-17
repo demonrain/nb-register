@@ -23,30 +23,30 @@ class OrchestratorGopayClient:
         self._stub = orchestrator_gopay_app_pb2_grpc.GoPayAppWorkflowServiceStub(channel)
         return self._pb2, self._stub
 
-    def status(self, state_key: str):
+    def status(self, user_id: str):
         pb2, stub = self._ensure_stub()
-        return stub.GoPayUserStatus(pb2.GoPayUserStatusRequest(state_key=state_key), timeout=self.timeout)
+        return stub.GoPayUserStatus(pb2.GoPayUserStatusRequest(user_id=user_id), timeout=self.timeout)
 
-    def clear_state(self, state_key: str):
+    def clear_state(self, user_id: str):
         pb2, stub = self._ensure_stub()
-        return stub.GoPayUserClearState(pb2.GoPayUserClearStateRequest(state_key=state_key), timeout=self.timeout)
+        return stub.GoPayUserClearState(pb2.GoPayUserClearStateRequest(user_id=user_id), timeout=self.timeout)
 
-    def set_wa_phone(self, state_key: str, *, wa_phone: str):
+    def set_wa_phone(self, user_id: str, *, wa_phone: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserSetWAPhone(
-            pb2.GoPayUserSetWAPhoneRequest(state_key=state_key, wa_phone=wa_phone),
+            pb2.GoPayUserSetWAPhoneRequest(user_id=user_id, wa_phone=wa_phone),
             timeout=self.timeout,
         )
 
-    def get_wa_phone(self, state_key: str):
+    def get_wa_phone(self, user_id: str):
         pb2, stub = self._ensure_stub()
-        return stub.GoPayUserGetWAPhone(pb2.GoPayUserGetWAPhoneRequest(state_key=state_key), timeout=self.timeout)
+        return stub.GoPayUserGetWAPhone(pb2.GoPayUserGetWAPhoneRequest(user_id=user_id), timeout=self.timeout)
 
-    def auth_start(self, state_key: str, *, phone: str, country_code: str, pin: str):
+    def auth_start(self, user_id: str, *, phone: str, country_code: str, pin: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserAuthStart(
             pb2.GoPayUserAuthStartRequest(
-                state_key=state_key,
+                user_id=user_id,
                 phone=phone,
                 country_code=country_code,
                 pin=pin,
@@ -54,39 +54,39 @@ class OrchestratorGopayClient:
             timeout=self.timeout,
         )
 
-    def auth_complete(self, state_key: str, *, otp: str, pin: str):
+    def auth_complete(self, user_id: str, *, otp: str, pin: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserAuthComplete(
-            pb2.GoPayUserAuthCompleteRequest(state_key=state_key, otp=otp, pin=pin),
+            pb2.GoPayUserAuthCompleteRequest(user_id=user_id, otp=otp, pin=pin),
             timeout=self.timeout,
         )
 
-    def change_phone_start(self, state_key: str, *, new_phone: str, pin: str):
+    def change_phone_start(self, user_id: str, *, new_phone: str, pin: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserChangePhoneStart(
-            pb2.GoPayUserChangePhoneStartRequest(state_key=state_key, new_phone=new_phone, pin=pin),
+            pb2.GoPayUserChangePhoneStartRequest(user_id=user_id, new_phone=new_phone, pin=pin),
             timeout=self.timeout,
         )
 
-    def change_phone_complete(self, state_key: str, *, otp: str):
+    def change_phone_complete(self, user_id: str, *, otp: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserChangePhoneComplete(
-            pb2.GoPayUserChangePhoneCompleteRequest(state_key=state_key, otp=otp),
+            pb2.GoPayUserChangePhoneCompleteRequest(user_id=user_id, otp=otp),
             timeout=self.timeout,
         )
 
-    def change_phone_retry(self, state_key: str):
+    def change_phone_retry(self, user_id: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserChangePhoneRetry(
-            pb2.GoPayUserChangePhoneRetryRequest(state_key=state_key),
+            pb2.GoPayUserChangePhoneRetryRequest(user_id=user_id),
             timeout=self.timeout,
         )
 
-    def signup_start(self, state_key: str, *, phone: str, name: str, email: str, country_code: str):
+    def signup_start(self, user_id: str, *, phone: str, name: str, email: str, country_code: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserSignupStart(
             pb2.GoPayUserSignupStartRequest(
-                state_key=state_key,
+                user_id=user_id,
                 phone=phone,
                 name=name,
                 email=email,
@@ -95,23 +95,23 @@ class OrchestratorGopayClient:
             timeout=self.timeout,
         )
 
-    def signup_complete(self, state_key: str, *, otp: str):
+    def signup_complete(self, user_id: str, *, otp: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserSignupComplete(
-            pb2.GoPayUserSignupCompleteRequest(state_key=state_key, otp=otp),
+            pb2.GoPayUserSignupCompleteRequest(user_id=user_id, otp=otp),
             timeout=self.timeout,
         )
 
-    def create_pin_start(self, state_key: str, *, pin: str):
+    def create_pin_start(self, user_id: str, *, pin: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserCreatePinStart(
-            pb2.GoPayUserCreatePinStartRequest(state_key=state_key, pin=pin),
+            pb2.GoPayUserCreatePinStartRequest(user_id=user_id, pin=pin),
             timeout=self.timeout,
         )
 
-    def create_pin_complete(self, state_key: str, *, otp: str, pin: str):
+    def create_pin_complete(self, user_id: str, *, otp: str, pin: str):
         pb2, stub = self._ensure_stub()
         return stub.GoPayUserCreatePinComplete(
-            pb2.GoPayUserCreatePinCompleteRequest(state_key=state_key, otp=otp, pin=pin),
+            pb2.GoPayUserCreatePinCompleteRequest(user_id=user_id, otp=otp, pin=pin),
             timeout=self.timeout,
         )

@@ -25,6 +25,7 @@ const (
 	goPayResolveWAPhoneActivityName              = contracts.GoPayResolveWAPhoneActivityName
 	goPayAppLoadStateActivityName                = contracts.GoPayAppLoadStateActivityName
 	goPayAppSaveStateActivityName                = contracts.GoPayAppSaveStateActivityName
+	goPayAppDeleteStateActivityName              = contracts.GoPayAppDeleteStateActivityName
 	goPayPaymentRebindSourceActivityName         = contracts.GoPayPaymentRebindSourceActivityName
 	goPayAppOTPStartActivityName                 = contracts.GoPayAppOTPStartActivityName
 	goPayAppOTPCompleteActivityName              = contracts.GoPayAppOTPCompleteActivityName

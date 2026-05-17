@@ -41,6 +41,7 @@ func registerTemporalWorker(w worker.Worker, s *activities.Server) {
 	w.RegisterActivityWithOptions(s.GoPayResolveWAPhoneActivity, activity.RegisterOptions{Name: goPayResolveWAPhoneActivityName})
 	w.RegisterActivityWithOptions(s.GoPayAppLoadStateActivity, activity.RegisterOptions{Name: goPayAppLoadStateActivityName})
 	w.RegisterActivityWithOptions(s.GoPayAppSaveStateActivity, activity.RegisterOptions{Name: goPayAppSaveStateActivityName})
+	w.RegisterActivityWithOptions(s.GoPayAppDeleteStateActivity, activity.RegisterOptions{Name: goPayAppDeleteStateActivityName})
 	w.RegisterActivityWithOptions(s.GoPayPaymentRebindSourceActivity, activity.RegisterOptions{Name: goPayPaymentRebindSourceActivityName})
 	w.RegisterActivityWithOptions(s.GoPayAppOTPStartActivity, activity.RegisterOptions{Name: goPayAppOTPStartActivityName})
 	w.RegisterActivityWithOptions(s.GoPayAppOTPCompleteActivity, activity.RegisterOptions{Name: goPayAppOTPCompleteActivityName})

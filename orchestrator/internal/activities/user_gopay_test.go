@@ -20,18 +20,18 @@ func TestNormalizeGoPayUserStateKeyUsesSingleSource(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeGoPayUserStateKey(tt.input)
+			got, err := normalizeGoPayUserID(tt.input)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("normalizeGoPayUserStateKey(%q) error = nil", tt.input)
+					t.Fatalf("normalizeGoPayUserID(%q) error = nil", tt.input)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("normalizeGoPayUserStateKey(%q) error = %v", tt.input, err)
+				t.Fatalf("normalizeGoPayUserID(%q) error = %v", tt.input, err)
 			}
 			if got != tt.want {
-				t.Fatalf("normalizeGoPayUserStateKey(%q) = %q; want %q", tt.input, got, tt.want)
+				t.Fatalf("normalizeGoPayUserID(%q) = %q; want %q", tt.input, got, tt.want)
 			}
 		})
 	}

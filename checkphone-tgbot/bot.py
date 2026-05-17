@@ -372,7 +372,7 @@ class TelegramCheckPhoneBot:
     def _clear_pending_gopay_flow(self, message: dict, chat_id: int) -> None:
         self._pending_gopay_flows.pop(self._pending_key(message, chat_id), None)
 
-    def _gopay_state_key(self, message: dict, chat_id: int) -> str:
+    def _gopay_user_id(self, message: dict, chat_id: int) -> str:
         _chat_id, user_id = self._pending_key(message, chat_id)
         return f"tg:{user_id}"
 
@@ -403,7 +403,7 @@ class TelegramCheckPhoneBot:
         if first == GOPAY_STATUS_COMMAND:
             self.send_chat_action(chat_id)
             try:
-                resp = self.gopay.status(self._gopay_state_key(message, chat_id))
+                resp = self.gopay.status(self._gopay_user_id(message, chat_id))
                 self.send_message(chat_id, format_gopay_status_response(resp), message.get("message_id"))
             except Exception as e:
                 self.send_message(chat_id, f"GoPay state 查询失败：{_redact_token(e)}", message.get("message_id"))
@@ -412,7 +412,7 @@ class TelegramCheckPhoneBot:
             self._clear_pending_gopay_flow(message, chat_id)
             self.send_chat_action(chat_id)
             try:
-                resp = self.gopay.clear_state(self._gopay_state_key(message, chat_id))
+                resp = self.gopay.clear_state(self._gopay_user_id(message, chat_id))
                 if _response_success(resp):
                     self.send_message(chat_id, "已清空你的 GoPay state。", message.get("message_id"))
                 else:
@@ -436,7 +436,7 @@ class TelegramCheckPhoneBot:
             return False
 
         step = session.get("step")
-        state_key = self._gopay_state_key(message, chat_id)
+        user_id = self._gopay_user_id(message, chat_id)
         message_id = message.get("message_id")
 
         if step in {"auth_phone", "signup_phone", "change_phone", "set_wa_phone"}:
@@ -456,7 +456,7 @@ class TelegramCheckPhoneBot:
                 resp = self._call_orchestrator(
                     chat_id,
                     message_id,
-                    lambda: self.gopay.set_wa_phone(state_key, wa_phone=request.phone),
+                    lambda: self.gopay.set_wa_phone(user_id, wa_phone=request.phone),
                 )
                 self._clear_pending_gopay_flow(message, chat_id)
                 if resp is not None:
@@ -490,7 +490,7 @@ class TelegramCheckPhoneBot:
                     chat_id,
                     message_id,
                     lambda: self.gopay.auth_start(
-                        state_key,
+                        user_id,
                         phone=str(session.get("phone") or ""),
                         country_code=str(session.get("country_code") or self.default_country_code),
                         pin=pin,
@@ -520,7 +520,7 @@ class TelegramCheckPhoneBot:
                     chat_id,
                     message_id,
                     lambda: self.gopay.signup_start(
-                        state_key,
+                        user_id,
                         phone=str(session.get("phone") or ""),
                         name="",
                         email="",
@@ -542,7 +542,7 @@ class TelegramCheckPhoneBot:
                     chat_id,
                     message_id,
                     lambda: self.gopay.change_phone_start(
-                        state_key,
+                        user_id,
                         new_phone=str(session.get("phone") or ""),
                         pin=pin,
                     ),
@@ -560,7 +560,7 @@ class TelegramCheckPhoneBot:
             resp = self._call_orchestrator(
                 chat_id,
                 message_id,
-                lambda: self.gopay.create_pin_start(state_key, pin=pin),
+                lambda: self.gopay.create_pin_start(user_id, pin=pin),
             )
             if resp is None:
                 self._clear_pending_gopay_flow(message, chat_id)
@@ -584,7 +584,7 @@ class TelegramCheckPhoneBot:
                 resp = self._call_orchestrator(
                     chat_id,
                     message_id,
-                    lambda: self.gopay.auth_complete(state_key, otp=otp, pin=pin),
+                    lambda: self.gopay.auth_complete(user_id, otp=otp, pin=pin),
                 )
                 if resp is None:
                     self._clear_pending_gopay_flow(message, chat_id)
@@ -597,7 +597,7 @@ class TelegramCheckPhoneBot:
                 resp = self._call_orchestrator(
                     chat_id,
                     message_id,
-                    lambda: self.gopay.signup_complete(state_key, otp=otp),
+                    lambda: self.gopay.signup_complete(user_id, otp=otp),
                 )
                 if resp is None:
                     self._clear_pending_gopay_flow(message, chat_id)
@@ -606,7 +606,7 @@ class TelegramCheckPhoneBot:
                     start_resp = self._call_orchestrator(
                         chat_id,
                         message_id,
-                        lambda: self.gopay.create_pin_start(state_key, pin=pin),
+                        lambda: self.gopay.create_pin_start(user_id, pin=pin),
                     )
                     if start_resp is not None and _response_success(start_resp) and getattr(start_resp, "otp_sent", False):
                         self._set_pending_gopay_flow(message, chat_id, {"step": "signup_pin_otp", "pin": pin})
@@ -623,7 +623,7 @@ class TelegramCheckPhoneBot:
                 resp = self._call_orchestrator(
                     chat_id,
                     message_id,
-                    lambda: self.gopay.create_pin_complete(state_key, otp=otp, pin=pin),
+                    lambda: self.gopay.create_pin_complete(user_id, otp=otp, pin=pin),
                 )
                 self._clear_pending_gopay_flow(message, chat_id)
                 if resp is not None:
@@ -633,7 +633,7 @@ class TelegramCheckPhoneBot:
             resp = self._call_orchestrator(
                 chat_id,
                 message_id,
-                lambda: self.gopay.change_phone_complete(state_key, otp=otp),
+                lambda: self.gopay.change_phone_complete(user_id, otp=otp),
             )
             self._clear_pending_gopay_flow(message, chat_id)
             if resp is not None:

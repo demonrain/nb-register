@@ -5,10 +5,10 @@ import (
 	"strings"
 )
 
-func normalizeGoPayUserStateKey(value string) (string, error) {
+func normalizeGoPayUserID(value string) (string, error) {
 	source, err := normalizeGoPaySource(value)
 	if err != nil {
-		return "", fmt.Errorf("state_key must be local or tg:<user_id>")
+		return "", fmt.Errorf("user_id must be local or tg:<user_id>")
 	}
 	return source, nil
 }
@@ -24,7 +24,7 @@ func normalizeGoPaySource(value string) (string, error) {
 			return "tg:" + userID, nil
 		}
 	}
-	return "", fmt.Errorf("source must be local or tg:<user_id>")
+	return "", fmt.Errorf("user_id must be local or tg:<user_id>")
 }
 
 func validTelegramUserID(value string) bool {

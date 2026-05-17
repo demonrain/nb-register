@@ -39,6 +39,7 @@ const (
 	GoPayResolveWAPhoneActivityName              = "GoPayResolveWAPhoneActivity"
 	GoPayAppLoadStateActivityName                = "GoPayAppLoadStateActivity"
 	GoPayAppSaveStateActivityName                = "GoPayAppSaveStateActivity"
+	GoPayAppDeleteStateActivityName              = "GoPayAppDeleteStateActivity"
 	GoPayPaymentRebindSourceActivityName         = "GoPayPaymentRebindSourceActivity"
 	GoPayAppOTPStartActivityName                 = "GoPayAppOTPStartActivity"
 	GoPayAppOTPCompleteActivityName              = "GoPayAppOTPCompleteActivity"

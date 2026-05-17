@@ -62,9 +62,12 @@ func (s *Server) startGoPayAppAuth(ctx context.Context, input GoPayAppOTPStartIn
 	}
 	data["token_invalid_reason"] = message
 
-	phone := configuredGoPayPhone()
+	phone := normalizeIndonesiaPhone(input.GetPhone())
 	if phone == "" {
-		return output, s.completeGoPayAppOTPStep(ctx, input.GetJobId(), stepName, data, fmt.Errorf("GOPAY_PHONE_NUMBER is required"))
+		phone = configuredGoPayPhone()
+	}
+	if phone == "" {
+		return output, s.completeGoPayAppOTPStep(ctx, input.GetJobId(), stepName, data, fmt.Errorf("gopay login phone is required"))
 	}
 	pin := configuredGoPayPIN()
 	if pin == "" {

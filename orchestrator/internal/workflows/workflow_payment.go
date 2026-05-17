@@ -375,7 +375,7 @@ func waitForGoPayPaymentOTP(ctx workflow.Context, input GoPayActivityInput, time
 	if normalizeGoPayOTPChannel(input.GetOtpChannel()) == "sms" && strings.TrimSpace(input.GetSmsActivationId()) != "" {
 		waitInput.Target = &pb.OTPWaitInput_Sms{Sms: &pb.OTPWaitSMSTarget{ActivationId: input.GetSmsActivationId()}}
 	} else {
-		source := strings.TrimSpace(input.GetStateKey())
+		source := strings.TrimSpace(input.GetUserId())
 		if source == "" {
 			source = goPayLocalSource
 		}

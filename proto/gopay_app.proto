@@ -389,30 +389,30 @@ message ReplayLinkPaymentResponse {
 // === GoPay state 持久化（由 gopay-app 自己持有）===
 
 message GetGoPayStateRequest {
-  string state_key = 1; // local 或 tg:<user_id>
+  string user_id = 1; // local 或 tg:<user_id>
 }
 
 message GetGoPayStateResponse {
   bool success = 1;
   string error_message = 2;
-  string state_key = 3;
+  string user_id = 3;
   string state_json = 4;
 }
 
 message UpsertGoPayStateRequest {
-  string state_key = 1; // local 或 tg:<user_id>
+  string user_id = 1; // local 或 tg:<user_id>
   string state_json = 2;
 }
 
 message UpsertGoPayStateResponse {
   bool success = 1;
   string error_message = 2;
-  string state_key = 3;
+  string user_id = 3;
   string state_json = 4;
 }
 
 message DeleteGoPayStateRequest {
-  string state_key = 1; // local 或 tg:<user_id>
+  string user_id = 1; // local 或 tg:<user_id>
 }
 
 message DeleteGoPayStateResponse {

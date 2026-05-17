@@ -21,16 +21,16 @@ class FakeGopayClient:
         self.auth_start_response = SimpleNamespace(success=True, error_message="", ready=True, otp_sent=False, stage="ready")
         self.auth_complete_response = SimpleNamespace(success=True, error_message="", ready=True, phone="6281234567890", stage="ready")
 
-    def auth_start(self, state_key, *, phone, country_code, pin):
-        self.calls.append(("auth_start", state_key, phone, country_code, pin))
+    def auth_start(self, user_id, *, phone, country_code, pin):
+        self.calls.append(("auth_start", user_id, phone, country_code, pin))
         return self.auth_start_response
 
-    def auth_complete(self, state_key, *, otp, pin):
-        self.calls.append(("auth_complete", state_key, otp, pin))
+    def auth_complete(self, user_id, *, otp, pin):
+        self.calls.append(("auth_complete", user_id, otp, pin))
         return self.auth_complete_response
 
-    def status(self, state_key):
-        self.calls.append(("status", state_key))
+    def status(self, user_id):
+        self.calls.append(("status", user_id))
         return SimpleNamespace(
             success=True,
             error_message="",
@@ -45,13 +45,13 @@ class FakeGopayClient:
             ),
         )
 
-    def clear_state(self, state_key):
-        self.calls.append(("clear_state", state_key))
+    def clear_state(self, user_id):
+        self.calls.append(("clear_state", user_id))
         return SimpleNamespace(success=True, error_message="")
 
-    def set_wa_phone(self, state_key, *, wa_phone):
-        self.calls.append(("set_wa_phone", state_key, wa_phone))
-        return SimpleNamespace(success=True, error_message="", state_key=state_key, wa_phone=wa_phone)
+    def set_wa_phone(self, user_id, *, wa_phone):
+        self.calls.append(("set_wa_phone", user_id, wa_phone))
+        return SimpleNamespace(success=True, error_message="", user_id=user_id, wa_phone=wa_phone)
 
 
 class TelegramBotParsingTests(unittest.TestCase):
@@ -159,7 +159,7 @@ class TelegramBotParsingTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("请发送要登录的 GoPay 手机号", messages[0])
 
-    def test_gopay_login_uses_orchestrator_state_key_per_user(self):
+    def test_gopay_login_uses_orchestrator_user_id_per_user(self):
         gopay = FakeGopayClient()
         bot = FakeTelegramBot(default_country_code="62", gopay=gopay)
 
@@ -253,7 +253,7 @@ class TelegramBotParsingTests(unittest.TestCase):
         self.assertIn("阶段：ready", text)
         self.assertIn("Token：有", text)
 
-    def test_set_gopay_wa_phone_uses_user_state_key(self):
+    def test_set_gopay_wa_phone_uses_user_id(self):
         gopay = FakeGopayClient()
         bot = FakeTelegramBot(default_country_code="62", gopay=gopay)
 

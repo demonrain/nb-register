@@ -21,13 +21,13 @@ func GoPayPaymentRebindWorkflow(ctx workflow.Context, input GoPayPaymentRebindWo
 	retryCtx := workflow.WithActivityOptions(ctx, retryableActivityOptions(30*time.Second, 5))
 	gopayCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(30*time.Minute))
 
-	stateKey := strings.TrimSpace(input.GetStateKey())
-	if stateKey == "" {
-		stateKey = goPayLocalSource
+	userID := strings.TrimSpace(input.GetUserId())
+	if userID == "" {
+		userID = goPayLocalSource
 	}
 	combined := map[string]any{
 		"source_job_id": input.GetSourceJobId(),
-		"state_key":     stateKey,
+		"user_id":       userID,
 	}
 
 	var source GoPayPaymentRebindSourceOutput
@@ -36,21 +36,21 @@ func GoPayPaymentRebindWorkflow(ctx workflow.Context, input GoPayPaymentRebindWo
 		JobId:       input.GetJobId(),
 		SourceJobId: input.GetSourceJobId(),
 		AccountId:   input.GetAccountId(),
-		StateKey:    input.GetStateKey(),
+		UserId:      input.GetUserId(),
 	}).Get(ctx, &source); err != nil {
 		combined["rebind_source"] = protoDataMap(source.GetData())
 		return failGoPayPaymentRebindWorkflow(ctx, retryCtx, result, input.GetJobId(), "resolve_rebind_source", statusFailedRetryable, false, true, err, combined), nil
 	}
 	combined["rebind_source"] = protoDataMap(source.GetData())
-	stateKey = source.GetStateKey()
-	result.StateKey = stateKey
+	userID = source.GetUserId()
+	result.UserId = userID
 	result.AccountId = source.GetAccountId()
 	result.WaPhone = source.GetWaPhone()
 
 	setWorkflowProgress(ctx, progress, "create_job")
 	params := map[string]string{
 		"source_job_id": source.GetSourceJobId(),
-		"state_key":     stateKey,
+		"user_id":       userID,
 	}
 	if strings.TrimSpace(source.GetWaPhone()) != "" {
 		params["wa_phone"] = source.GetWaPhone()
@@ -68,9 +68,9 @@ func GoPayPaymentRebindWorkflow(ctx workflow.Context, input GoPayPaymentRebindWo
 	var stored GoPayAppStateActivityOutput
 	setWorkflowProgress(ctx, progress, "load_gopay_state")
 	if err := workflow.ExecuteActivity(retryCtx, goPayAppLoadStateActivityName, GoPayAppStateActivityInput{
-		JobId:    input.GetJobId(),
-		StateKey: stateKey,
-		Reason:   "payment_rebind_retry",
+		JobId:  input.GetJobId(),
+		UserId: userID,
+		Reason: "payment_rebind_retry",
 	}).Get(ctx, &stored); err != nil {
 		combined["load_state"] = protoDataMap(stored.GetData())
 		return failGoPayPaymentRebindWorkflow(ctx, retryCtx, result, input.GetJobId(), "load_gopay_state", statusFailedRetryable, false, true, err, combined), nil
@@ -81,19 +81,43 @@ func GoPayPaymentRebindWorkflow(ctx workflow.Context, input GoPayPaymentRebindWo
 	}
 	combined["load_state"] = protoDataMap(stored.GetData())
 
+	setWorkflowProgress(ctx, progress, stepGoPayAppLogin)
+	auth, err := runGoPayAppAuth(ctx, gopayCtx, retryCtx, input.GetJobId(), goPayAppOTPOptions{
+		Phone:      source.GetWaPhone(),
+		OTPChannel: "wa",
+		Source:     userID,
+		StateJSON:  stateJSON,
+	})
+	combined["login"] = protoDataMap(auth.GetData())
+	if nextStateJSON := strings.TrimSpace(auth.GetStateJson()); nextStateJSON != "" {
+		stateJSON = nextStateJSON
+	}
+	if err != nil {
+		return failGoPayPaymentRebindWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppLogin, statusFailedRetryable, false, true, err, combined), nil
+	}
+	_ = workflow.ExecuteActivity(retryCtx, goPayAppSaveStateActivityName, GoPayAppStateActivityInput{
+		JobId:     input.GetJobId(),
+		UserId:    userID,
+		StateJson: stateJSON,
+		Reason:    "payment_rebind_login_ready",
+	}).Get(ctx, nil)
+
 	setWorkflowProgress(ctx, progress, stepGoPayAppChangePhone)
 	changePhone, err := runGoPayAppChangePhone(ctx, gopayCtx, input.GetJobId(), stateJSON)
-	stateJSON = changePhone.GetStateJson()
 	combined["change_phone"] = protoDataMap(changePhone.GetData())
 	result.ActivationId = changePhone.GetActivationId()
 	result.BoundPhone = changePhone.GetPhone()
 	result.ChangePhoneComplete = changePhone.GetChangePhoneComplete()
-	_ = workflow.ExecuteActivity(retryCtx, goPayAppSaveStateActivityName, GoPayAppStateActivityInput{
-		JobId:     input.GetJobId(),
-		StateKey:  stateKey,
-		StateJson: stateJSON,
-		Reason:    "payment_rebind_retry_attempt",
-	}).Get(ctx, nil)
+	nextStateJSON := strings.TrimSpace(changePhone.GetStateJson())
+	if nextStateJSON != "" {
+		stateJSON = nextStateJSON
+		_ = workflow.ExecuteActivity(retryCtx, goPayAppSaveStateActivityName, GoPayAppStateActivityInput{
+			JobId:     input.GetJobId(),
+			UserId:    userID,
+			StateJson: stateJSON,
+			Reason:    "payment_rebind_attempt",
+		}).Get(ctx, nil)
+	}
 	if err != nil {
 		return failGoPayPaymentRebindWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppChangePhone, statusFailedRetryable, false, true, err, combined), nil
 	}
@@ -104,6 +128,11 @@ func GoPayPaymentRebindWorkflow(ctx workflow.Context, input GoPayPaymentRebindWo
 	if err := finishGoPayChangePhoneSMS(ctx, retryCtx, input.GetJobId(), result.GetActivationId(), "payment_rebind_retry_complete"); err != nil {
 		return failGoPayPaymentRebindWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppSMSFinish, statusFailedRetryable, false, true, err, combined), nil
 	}
+	_ = workflow.ExecuteActivity(retryCtx, goPayAppDeleteStateActivityName, GoPayAppStateActivityInput{
+		JobId:  input.GetJobId(),
+		UserId: userID,
+		Reason: "payment_rebind_complete",
+	}).Get(ctx, nil)
 
 	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
 		JobId:  input.GetJobId(),

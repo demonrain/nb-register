@@ -10,13 +10,13 @@ func (s *Server) userGoPayStatus(ctx context.Context, stateKey string) (*pb.Stat
 	if s.gopayClient == nil {
 		return nil, fmt.Errorf("gopay app client not configured")
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := s.gopayClient.Status(ctx, &pb.StatusRequest{StateJson: stateJSON})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return resp, fmt.Errorf("Status: %w", err)
@@ -28,7 +28,7 @@ func (s *Server) userGoPayStatus(ctx context.Context, stateKey string) (*pb.Stat
 }
 
 func (s *Server) GoPayUserStatus(ctx context.Context, req *pb.GoPayUserStatusRequest) (*pb.GoPayUserStatusResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserStatusResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -40,11 +40,11 @@ func (s *Server) GoPayUserStatus(ctx context.Context, req *pb.GoPayUserStatusReq
 }
 
 func (s *Server) GoPayUserClearState(ctx context.Context, req *pb.GoPayUserClearStateRequest) (*pb.GoPayUserClearStateResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserClearStateResponse{ErrorMessage: err.Error()}, nil
 	}
-	if err := s.deleteGoPayAppStateForKey(ctx, stateKey); err != nil {
+	if err := s.deleteGoPayAppStateForUser(ctx, stateKey); err != nil {
 		return &pb.GoPayUserClearStateResponse{ErrorMessage: err.Error()}, nil
 	}
 	return &pb.GoPayUserClearStateResponse{Success: true}, nil

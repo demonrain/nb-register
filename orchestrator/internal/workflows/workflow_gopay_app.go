@@ -388,6 +388,7 @@ func runGoPayAppAuth(ctx workflow.Context, activityCtx workflow.Context, cancelC
 			JobId:           jobID,
 			Operation:       goPayAppOTPOperationAuth,
 			StepName:        stepGoPayAppLogin,
+			Phone:           opts.Phone,
 			OtpChannel:      opts.OTPChannel,
 			SmsActivationId: opts.SMSActivationID,
 			StateJson:       stateJSON,

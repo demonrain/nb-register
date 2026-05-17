@@ -72,14 +72,14 @@ func (s *Server) goPayStatus(ctx context.Context) (*pb.StatusResponse, error) {
 }
 
 func (s *Server) loadGoPayAppState(ctx context.Context) (string, error) {
-	return s.loadGoPayAppStateForKey(ctx, goPayAppStateKey)
+	return s.loadGoPayAppStateForUser(ctx, goPayAppStateKey)
 }
 
-func (s *Server) loadGoPayAppStateForKey(ctx context.Context, stateKey string) (string, error) {
+func (s *Server) loadGoPayAppStateForUser(ctx context.Context, stateKey string) (string, error) {
 	if s.gopayClient == nil {
 		return "{}", fmt.Errorf("gopay-app client not configured")
 	}
-	resp, err := s.gopayClient.GetGoPayState(ctx, &pb.GetGoPayStateRequest{StateKey: stateKey})
+	resp, err := s.gopayClient.GetGoPayState(ctx, &pb.GetGoPayStateRequest{UserId: stateKey})
 	if err != nil {
 		return "", fmt.Errorf("GetGoPayState: %w", err)
 	}
@@ -97,10 +97,10 @@ func (s *Server) loadGoPayAppStateForKey(ctx context.Context, stateKey string) (
 }
 
 func (s *Server) saveGoPayAppState(ctx context.Context, stateJSON string) error {
-	return s.saveGoPayAppStateForKey(ctx, goPayAppStateKey, stateJSON)
+	return s.saveGoPayAppStateForUser(ctx, goPayAppStateKey, stateJSON)
 }
 
-func (s *Server) saveGoPayAppStateForKey(ctx context.Context, stateKey string, stateJSON string) error {
+func (s *Server) saveGoPayAppStateForUser(ctx context.Context, stateKey string, stateJSON string) error {
 	stateJSON = strings.TrimSpace(stateJSON)
 	if stateJSON == "" {
 		return nil
@@ -109,7 +109,7 @@ func (s *Server) saveGoPayAppStateForKey(ctx context.Context, stateKey string, s
 		return fmt.Errorf("gopay-app client not configured")
 	}
 	resp, err := s.gopayClient.UpsertGoPayState(ctx, &pb.UpsertGoPayStateRequest{
-		StateKey:  stateKey,
+		UserId:    stateKey,
 		StateJson: stateJSON,
 	})
 	if err != nil {
@@ -124,11 +124,11 @@ func (s *Server) saveGoPayAppStateForKey(ctx context.Context, stateKey string, s
 	return nil
 }
 
-func (s *Server) deleteGoPayAppStateForKey(ctx context.Context, stateKey string) error {
+func (s *Server) deleteGoPayAppStateForUser(ctx context.Context, stateKey string) error {
 	if s.gopayClient == nil {
 		return fmt.Errorf("gopay-app client not configured")
 	}
-	resp, err := s.gopayClient.DeleteGoPayState(ctx, &pb.DeleteGoPayStateRequest{StateKey: stateKey})
+	resp, err := s.gopayClient.DeleteGoPayState(ctx, &pb.DeleteGoPayStateRequest{UserId: stateKey})
 	if err != nil {
 		return fmt.Errorf("DeleteGoPayState: %w", err)
 	}

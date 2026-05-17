@@ -1,10 +1,13 @@
 package workflows
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -33,16 +36,17 @@ func goPaySMSPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInp
 	if otpChannel == "" {
 		otpChannel = "sms"
 	}
-	stateKey := strings.TrimSpace(input.GetStateKey())
-	if stateKey == "" {
-		stateKey = goPayLocalSource
+	userID := strings.TrimSpace(input.GetUserId())
+	if userID == "" {
+		userID = goPayLocalSource
 	}
-	result.StateKey = stateKey
+	result.UserId = userID
 	addBalance := input.GetAddBalance()
 	addBalanceMethod := goPayAddBalanceMethod(addBalance)
 	stateJSON := "{}"
 	combined := map[string]any{
 		"otp_channel":        otpChannel,
+		"user_id":            userID,
 		"add_balance_method": addBalanceMethod,
 	}
 
@@ -65,7 +69,7 @@ func goPaySMSPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInp
 		Params: map[string]string{
 			"otp_channel":        otpChannel,
 			"add_balance_method": addBalanceMethod,
-			"state_key":          stateKey,
+			"user_id":            userID,
 		},
 	}).Get(ctx, nil); err != nil {
 		result.ErrorMessage = err.Error()
@@ -123,7 +127,7 @@ func goPaySMSPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInp
 			Phone:           phone.GetPhone(),
 			OTPChannel:      otpChannel,
 			SMSActivationID: phone.GetActivationId(),
-			Source:          stateKey,
+			Source:          userID,
 			ResetState:      true,
 			StateJSON:       stateJSON,
 		}
@@ -270,7 +274,7 @@ func goPaySMSPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInp
 		GopayPhone:        result.GetPhone(),
 		OtpChannel:        otpChannel,
 		SmsActivationId:   otpOpts.SMSActivationID,
-		StateKey:          stateKey,
+		UserId:            userID,
 		StateJson:         stateJSON,
 	})
 	stateJSON = payment.GetStateJson()
@@ -316,17 +320,17 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	paymentCtx := workflow.WithActivityOptions(ctx, paymentActivityOptions())
 	tierCtx := workflow.WithActivityOptions(ctx, atomicActivityOptions(2*time.Minute))
 
-	stateKey := strings.TrimSpace(input.GetStateKey())
-	if stateKey == "" {
-		stateKey = goPayLocalSource
+	userID := strings.TrimSpace(input.GetUserId())
+	if userID == "" {
+		userID = goPayLocalSource
 	}
-	result.StateKey = stateKey
+	result.UserId = userID
 	addBalance := input.GetAddBalance()
 	addBalanceMethod := goPayAddBalanceMethod(addBalance)
 	stateJSON := "{}"
 	combined := map[string]any{
 		"otp_channel":        "wa",
-		"state_key":          stateKey,
+		"user_id":            userID,
 		"add_balance_method": addBalanceMethod,
 	}
 
@@ -344,7 +348,7 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	setWorkflowProgress(ctx, progress, "create_job")
 	params := map[string]string{
 		"otp_channel":        "wa",
-		"state_key":          stateKey,
+		"user_id":            userID,
 		"add_balance_method": addBalanceMethod,
 	}
 	if strings.TrimSpace(input.GetWaPhone()) != "" {
@@ -380,15 +384,15 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	var waPhone GoPayResolveWAPhoneOutput
 	setWorkflowProgress(ctx, progress, stepGoPayAppWAPhoneCheck)
 	if err := workflow.ExecuteActivity(gopayCtx, goPayResolveWAPhoneActivityName, GoPayResolveWAPhoneInput{
-		JobId:    input.GetJobId(),
-		StateKey: stateKey,
-		WaPhone:  input.GetWaPhone(),
+		JobId:   input.GetJobId(),
+		UserId:  userID,
+		WaPhone: input.GetWaPhone(),
 	}).Get(ctx, &waPhone); err != nil {
 		combined["wa_phone"] = protoDataMap(waPhone.GetData())
 		return failGoPayPaymentWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppWAPhoneCheck, statusFailedRetryable, false, true, err, combined), nil
 	}
-	stateKey = waPhone.GetStateKey()
-	result.StateKey = stateKey
+	userID = waPhone.GetUserId()
+	result.UserId = userID
 	result.WaPhone = waPhone.GetWaPhone()
 	result.Phone = waPhone.GetWaPhone()
 	combined["wa_phone"] = result.GetWaPhone()
@@ -397,7 +401,7 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	otpOpts := goPayAppOTPOptions{
 		Phone:      result.GetWaPhone(),
 		OTPChannel: "wa",
-		Source:     stateKey,
+		Source:     userID,
 		ResetState: true,
 		StateJSON:  stateJSON,
 	}
@@ -487,7 +491,7 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 		CheckoutUrl:       probe.GetCheckoutUrl(),
 		CheckoutSessionId: probe.GetCheckoutSessionId(),
 		GopayPhone:        result.GetWaPhone(),
-		StateKey:          stateKey,
+		UserId:            userID,
 		StateJson:         stateJSON,
 	})
 	stateJSON = paymentPrepare.GetStateJson()
@@ -508,7 +512,7 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 		PreparedFlowId:    paymentPrepare.GetFlowId(),
 		GopayPhone:        result.GetWaPhone(),
 		OtpChannel:        "wa",
-		StateKey:          stateKey,
+		UserId:            userID,
 		StateJson:         stateJSON,
 	})
 	stateJSON = payment.GetStateJson()
@@ -523,30 +527,11 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	combined["snap_token"] = result.GetSnapToken()
 	_ = workflow.ExecuteActivity(retryCtx, goPayAppSaveStateActivityName, GoPayAppStateActivityInput{
 		JobId:     input.GetJobId(),
-		StateKey:  stateKey,
+		UserId:    userID,
 		StateJson: stateJSON,
-		Reason:    "payment_completed_before_rebind",
+		Reason:    "wa_payment_completed",
 	}).Get(ctx, nil)
-
-	setWorkflowProgress(ctx, progress, stepGoPayAppChangePhone)
-	changePhone, err := runGoPayAppChangePhone(ctx, gopayCtx, input.GetJobId(), stateJSON)
-	stateJSON = changePhone.GetStateJson()
-	combined["change_phone"] = protoDataMap(changePhone.GetData())
-	result.ChangePhoneActivationId = changePhone.GetActivationId()
-	result.BoundPhone = changePhone.GetPhone()
-	result.ChangePhoneComplete = changePhone.GetChangePhoneComplete()
-	_ = workflow.ExecuteActivity(retryCtx, goPayAppSaveStateActivityName, GoPayAppStateActivityInput{
-		JobId:     input.GetJobId(),
-		StateKey:  stateKey,
-		StateJson: stateJSON,
-		Reason:    "payment_rebind_attempt",
-	}).Get(ctx, nil)
-	if err != nil {
-		return failGoPayPaymentWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppChangePhone, statusFailedRecoverable, true, false, err, combined), nil
-	}
-	if err := finishGoPayChangePhoneSMS(ctx, retryCtx, input.GetJobId(), result.GetChangePhoneActivationId(), "payment_rebind_complete"); err != nil {
-		return failGoPayPaymentWorkflow(ctx, retryCtx, result, input.GetJobId(), stepGoPayAppSMSFinish, statusFailedRecoverable, true, false, err, combined), nil
-	}
+	combined["rebind_required"] = true
 
 	var tier ProbeTierActivityOutput
 	setWorkflowProgress(ctx, progress, stepProbeTier)
@@ -559,6 +544,11 @@ func goPayWAPaymentWorkflow(ctx workflow.Context, input GoPayPaymentWorkflowInpu
 	}
 	combined["probe_tier"] = protoDataMap(tier.GetData())
 
+	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
+		JobId:  input.GetJobId(),
+		Result: protoData(combined),
+	}).Get(ctx, nil)
+	startGoPayPaymentRebindSideEffect(ctx, input.GetJobId(), account.GetAccountId(), userID, combined)
 	_ = workflow.ExecuteActivity(retryCtx, markJobSucceededActivityName, JobSuccessInput{
 		JobId:  input.GetJobId(),
 		Result: protoData(combined),
@@ -586,4 +576,47 @@ func isGoPaySignupPhoneRotatableError(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "signup phone already registered")
+}
+
+func startGoPayPaymentRebindSideEffect(ctx workflow.Context, sourceJobID string, accountID string, userID string, combined map[string]any) {
+	sourceJobID = strings.TrimSpace(sourceJobID)
+	if sourceJobID == "" {
+		return
+	}
+	rebindJobID := sourceJobID + "-rebind"
+	workflowID := "gopay-payment-rebind-" + rebindJobID
+	data := map[string]any{
+		"job_id":        rebindJobID,
+		"workflow_id":   workflowID,
+		"source_job_id": sourceJobID,
+		"account_id":    accountID,
+		"user_id":       userID,
+	}
+	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WorkflowID:        workflowID,
+		ParentClosePolicy: enumspb.PARENT_CLOSE_POLICY_ABANDON,
+	})
+	future := workflow.ExecuteChildWorkflow(childCtx, GoPayPaymentRebindWorkflow, GoPayPaymentRebindWorkflowInput{
+		JobId:       rebindJobID,
+		SourceJobId: sourceJobID,
+		AccountId:   accountID,
+		UserId:      userID,
+	})
+	err := future.GetChildWorkflowExecution().Get(ctx, nil)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) {
+			data["started"] = true
+			data["already_started"] = true
+		} else {
+			data["started"] = false
+			data["error_message"] = err.Error()
+			workflow.GetLogger(ctx).Warn("failed to start gopay payment rebind side effect", "source_job_id", sourceJobID, "error", err)
+		}
+	} else {
+		data["started"] = true
+	}
+	combined["rebind"] = data
+	combined["rebind_job_id"] = rebindJobID
+	combined["rebind_started"] = data["started"]
 }

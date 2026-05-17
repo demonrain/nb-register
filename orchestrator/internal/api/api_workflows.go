@@ -189,7 +189,7 @@ func (s *Server) RunGoPayPayment(ctx context.Context, req *pb.GoPayPaymentReques
 		SmsActivationId:                 strings.TrimSpace(req.GetSmsActivationId()),
 		AddBalance:                      addBalance,
 		AddBalanceConfirmTimeoutSeconds: addBalanceConfirmTimeoutSeconds,
-		StateKey:                        strings.TrimSpace(req.GetStateKey()),
+		UserId:                          strings.TrimSpace(req.GetUserId()),
 		WaPhone:                         strings.TrimSpace(req.GetWaPhone()),
 	})
 	if err != nil {
@@ -199,16 +199,16 @@ func (s *Server) RunGoPayPayment(ctx context.Context, req *pb.GoPayPaymentReques
 }
 
 func (s *Server) RetryGoPayPaymentRebind(ctx context.Context, req *pb.GoPayPaymentRebindRequest) (*pb.GoPayPaymentResponse, error) {
-	jobID := uuid.NewString()
 	sourceJobID := strings.TrimSpace(req.GetSourceJobId())
 	if sourceJobID == "" {
-		return &pb.GoPayPaymentResponse{JobId: jobID, ErrorMessage: "source_job_id is required"}, nil
+		return &pb.GoPayPaymentResponse{ErrorMessage: "source_job_id is required"}, nil
 	}
+	jobID := uuid.NewString()
 	_, err := s.temporal.ExecuteWorkflow(ctx, s.workflowOptions(workflowIDForAction(actionGoPayPaymentRebind, jobID)), workflows.GoPayPaymentRebindWorkflow, workflows.GoPayPaymentRebindWorkflowInput{
 		JobId:       jobID,
 		SourceJobId: sourceJobID,
 		AccountId:   strings.TrimSpace(req.GetAccountId()),
-		StateKey:    strings.TrimSpace(req.GetStateKey()),
+		UserId:      strings.TrimSpace(req.GetUserId()),
 	})
 	if err != nil {
 		return &pb.GoPayPaymentResponse{JobId: jobID, ErrorMessage: err.Error()}, nil

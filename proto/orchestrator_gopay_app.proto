@@ -64,8 +64,8 @@ message GoPayPaymentRequest {
   string sms_activation_id = 4; // 续跑已取号流程时复用同一个短信激活号
   GoPayAddBalance add_balance = 5;
   int32 add_balance_confirm_timeout_seconds = 6;
-  string state_key = 7; // local 或 tg:<user_id>；WA 接码来源和 GoPay state key
-  string wa_phone = 8; // WA 支付注册手机号；为空时使用 state_key 已保存值或本地配置
+  string user_id = 7; // local 或 tg:<user_id>；WA 接码来源和 GoPay state 归属用户
+  string wa_phone = 8; // WA 支付注册手机号；为空时使用 user_id 已保存值或本地配置
 }
 
 message GoPayPaymentResponse {
@@ -84,13 +84,13 @@ message GoPayPaymentResponse {
   string bound_phone = 13;
   string change_phone_activation_id = 14;
   bool change_phone_complete = 15;
-  string state_key = 16;
+  string user_id = 16;
 }
 
 message GoPayPaymentRebindRequest {
   string source_job_id = 1;
   string account_id = 2;
-  string state_key = 3;
+  string user_id = 3;
 }
 
 message GoPayAddBalance {
@@ -149,7 +149,7 @@ message ConfirmManualAddBalanceResponse {
 }
 
 message GoPayUserStatusRequest {
-  string state_key = 1;
+  string user_id = 1;
 }
 
 message GoPayUserStatusResponse {
@@ -159,7 +159,7 @@ message GoPayUserStatusResponse {
 }
 
 message GoPayUserClearStateRequest {
-  string state_key = 1;
+  string user_id = 1;
 }
 
 message GoPayUserClearStateResponse {
@@ -168,23 +168,23 @@ message GoPayUserClearStateResponse {
 }
 
 message GoPayUserSetWAPhoneRequest {
-  string state_key = 1;
+  string user_id = 1;
   string wa_phone = 2;
 }
 
 message GoPayUserGetWAPhoneRequest {
-  string state_key = 1;
+  string user_id = 1;
 }
 
 message GoPayUserWAPhoneResponse {
   bool success = 1;
   string error_message = 2;
-  string state_key = 3;
+  string user_id = 3;
   string wa_phone = 4;
 }
 
 message GoPayUserAuthStartRequest {
-  string state_key = 1;
+  string user_id = 1;
   string phone = 2;
   string country_code = 3;
   string pin = 4;
@@ -204,7 +204,7 @@ message GoPayUserAuthStartResponse {
 }
 
 message GoPayUserAuthCompleteRequest {
-  string state_key = 1;
+  string user_id = 1;
   string otp = 2;
   string pin = 3;
 }
@@ -221,7 +221,7 @@ message GoPayUserAuthCompleteResponse {
 }
 
 message GoPayUserChangePhoneStartRequest {
-  string state_key = 1;
+  string user_id = 1;
   string new_phone = 2;
   string pin = 3;
 }
@@ -234,7 +234,7 @@ message GoPayUserChangePhoneStartResponse {
 }
 
 message GoPayUserChangePhoneCompleteRequest {
-  string state_key = 1;
+  string user_id = 1;
   string otp = 2;
 }
 
@@ -244,7 +244,7 @@ message GoPayUserChangePhoneCompleteResponse {
 }
 
 message GoPayUserChangePhoneRetryRequest {
-  string state_key = 1;
+  string user_id = 1;
 }
 
 message GoPayUserChangePhoneRetryResponse {
@@ -254,7 +254,7 @@ message GoPayUserChangePhoneRetryResponse {
 }
 
 message GoPayUserSignupStartRequest {
-  string state_key = 1;
+  string user_id = 1;
   string phone = 2;
   string name = 3;
   string email = 4;
@@ -271,7 +271,7 @@ message GoPayUserSignupStartResponse {
 }
 
 message GoPayUserSignupCompleteRequest {
-  string state_key = 1;
+  string user_id = 1;
   string otp = 2;
 }
 
@@ -283,7 +283,7 @@ message GoPayUserSignupCompleteResponse {
 }
 
 message GoPayUserCreatePinStartRequest {
-  string state_key = 1;
+  string user_id = 1;
   string pin = 2;
   string otp_channel = 3; // sms 或 wa；为空默认 sms
 }
@@ -297,7 +297,7 @@ message GoPayUserCreatePinStartResponse {
 }
 
 message GoPayUserCreatePinCompleteRequest {
-  string state_key = 1;
+  string user_id = 1;
   string otp = 2;
   string pin = 3;
 }
@@ -333,7 +333,7 @@ message GoPayPaymentWorkflowInput {
   string sms_activation_id = 5;
   GoPayAddBalance add_balance = 6;
   int32 add_balance_confirm_timeout_seconds = 7;
-  string state_key = 8;
+  string user_id = 8;
   string wa_phone = 9;
 }
 
@@ -355,14 +355,14 @@ message GoPayPaymentWorkflowResult {
   string bound_phone = 15;
   string change_phone_activation_id = 16;
   bool change_phone_complete = 17;
-  string state_key = 18;
+  string user_id = 18;
 }
 
 message GoPayPaymentRebindWorkflowInput {
   string job_id = 1;
   string source_job_id = 2;
   string account_id = 3;
-  string state_key = 4;
+  string user_id = 4;
 }
 
 message GoPayPaymentRebindWorkflowResult {
@@ -374,7 +374,7 @@ message GoPayPaymentRebindWorkflowResult {
   string activation_id = 6;
   string bound_phone = 7;
   bool change_phone_complete = 8;
-  string state_key = 9;
+  string user_id = 9;
   string wa_phone = 10;
 }
 
@@ -431,25 +431,25 @@ message GoPayAppAcquireSignupPhoneOutput {
 
 message GoPayResolveWAPhoneInput {
   string job_id = 1;
-  string state_key = 2;
+  string user_id = 2;
   string wa_phone = 3;
 }
 
 message GoPayResolveWAPhoneOutput {
-  string state_key = 1;
+  string user_id = 1;
   string wa_phone = 2;
   google.protobuf.Struct data = 3;
 }
 
 message GoPayAppStateActivityInput {
   string job_id = 1;
-  string state_key = 2;
+  string user_id = 2;
   string state_json = 3;
   string reason = 4;
 }
 
 message GoPayAppStateActivityOutput {
-  string state_key = 1;
+  string user_id = 1;
   string state_json = 2;
   google.protobuf.Struct data = 3;
 }
@@ -458,13 +458,13 @@ message GoPayPaymentRebindSourceInput {
   string job_id = 1;
   string source_job_id = 2;
   string account_id = 3;
-  string state_key = 4;
+  string user_id = 4;
 }
 
 message GoPayPaymentRebindSourceOutput {
   string source_job_id = 1;
   string account_id = 2;
-  string state_key = 3;
+  string user_id = 3;
   string wa_phone = 4;
   string charge_ref = 5;
   string snap_token = 6;

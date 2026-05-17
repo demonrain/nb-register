@@ -442,7 +442,7 @@ function App() {
     try {
       const payload: Record<string, any> = {
         account_id: account.account_id,
-        state_key: 'local',
+        user_id: 'local',
         otp_channel: otpChannel
       };
       const resp = await api<any>('/api/workflows/gopay-payment', {
@@ -533,12 +533,14 @@ function App() {
 
   async function retryGoPayPaymentRebind(job: Job) {
     try {
+      const result = objectValue(job.result);
+      const sourceJobId = job.action === 'GOPAY_PAYMENT_REBIND' ? stringValue(result.source_job_id) : job.job_id;
       const resp = await api<any>('/api/workflows/gopay-payment/rebind', {
         method: 'POST',
         body: JSON.stringify({
-          source_job_id: job.job_id,
+          source_job_id: sourceJobId,
           account_id: job.account_id || '',
-          state_key: goPayPaymentStateKey(job)
+          user_id: goPayPaymentUserId(job)
         })
       });
       if (resp.error_message) {
@@ -1545,12 +1547,12 @@ function GoPayRebindPanel({ job, onRetry }: {
     <div className="manualBalancePanel">
       <div className="manualBalanceHead">
         <span><RefreshCcw size={15} /> 支付后换绑</span>
-        <StatusBadge status="FAILED_RECOVERABLE" />
+        <StatusBadge status={job.status} />
       </div>
       <div className="rebindRetryBox">
-        <span>支付已完成，继续执行 SMS 换绑。</span>
+        <span>支付已完成，可单独执行 SMS 换绑。</span>
         <Button className="primaryButton" disabled={submitting} onClick={() => void retry()}>
-          <RefreshCcw size={14} /> 重试换绑
+          <RefreshCcw size={14} /> 开始换绑
         </Button>
       </div>
     </div>
@@ -2621,18 +2623,23 @@ function canSelectGoPayAddBalance(job: Job, progress: WorkflowProgress | null, b
 }
 
 function canRetryGoPayPaymentRebind(job: Job) {
-  if (job.action !== 'GOPAY_PAYMENT' || job.status !== 'FAILED_RECOVERABLE') return false;
   const result = objectValue(job.result);
+  if (job.action === 'GOPAY_PAYMENT_REBIND') {
+    return job.status === 'FAILED_RETRYABLE' || job.status === 'FAILED_RECOVERABLE';
+  }
+  if (job.action !== 'GOPAY_PAYMENT') return false;
+  const rebindStarted = result.rebind_started === true || String(result.rebind_started || '').toLowerCase() === 'true';
+  if (rebindStarted) return false;
   const paymentCompleted = result.payment_completed === true || String(result.payment_completed || '').toLowerCase() === 'true';
   const hasPayment = !!(stringValue(result.charge_ref) || stringValue(result.snap_token));
   const changePhone = objectValue(result.change_phone);
   const changeComplete = result.change_phone_complete === true || changePhone.change_phone_complete === true;
-  return paymentCompleted && hasPayment && !changeComplete && job.last_step === 'gopay_app_change_phone';
+  return paymentCompleted && hasPayment && !changeComplete && (job.status === 'SUCCEEDED' || job.status === 'FAILED_RECOVERABLE' || job.status === 'FAILED_RETRYABLE');
 }
 
-function goPayPaymentStateKey(job: Job) {
+function goPayPaymentUserId(job: Job) {
   const result = objectValue(job.result);
-  return stringValue(result.state_key) || 'local';
+  return stringValue(result.user_id) || 'local';
 }
 
 function stepResultData(job: Job, stepName: string): any | null {

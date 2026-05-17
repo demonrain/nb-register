@@ -394,32 +394,32 @@ export interface ReplayLinkPaymentResponse {
 
 export interface GetGoPayStateRequest {
   /** local 或 tg:<user_id> */
-  state_key: string;
+  user_id: string;
 }
 
 export interface GetGoPayStateResponse {
   success: boolean;
   error_message: string;
-  state_key: string;
+  user_id: string;
   state_json: string;
 }
 
 export interface UpsertGoPayStateRequest {
   /** local 或 tg:<user_id> */
-  state_key: string;
+  user_id: string;
   state_json: string;
 }
 
 export interface UpsertGoPayStateResponse {
   success: boolean;
   error_message: string;
-  state_key: string;
+  user_id: string;
   state_json: string;
 }
 
 export interface DeleteGoPayStateRequest {
   /** local 或 tg:<user_id> */
-  state_key: string;
+  user_id: string;
 }
 
 export interface DeleteGoPayStateResponse {

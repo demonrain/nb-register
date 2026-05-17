@@ -8,20 +8,20 @@ import (
 )
 
 func (s *Server) GoPayUserCreatePinStart(ctx context.Context, req *pb.GoPayUserCreatePinStartRequest) (*pb.GoPayUserCreatePinStartResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserCreatePinStartResponse{ErrorMessage: err.Error()}, nil
 	}
 	if strings.TrimSpace(req.GetPin()) == "" {
 		return &pb.GoPayUserCreatePinStartResponse{ErrorMessage: "pin is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserCreatePinStartResponse{ErrorMessage: err.Error()}, nil
 	}
 	resp, err := s.gopayClient.CreatePinStart(ctx, &pb.CreatePinStartRequest{Pin: req.GetPin(), OtpChannel: req.GetOtpChannel(), StateJson: stateJSON})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserCreatePinStartResponse{ErrorMessage: fmt.Sprintf("CreatePinStart: %v", err)}, nil
@@ -36,7 +36,7 @@ func (s *Server) GoPayUserCreatePinStart(ctx context.Context, req *pb.GoPayUserC
 }
 
 func (s *Server) GoPayUserCreatePinComplete(ctx context.Context, req *pb.GoPayUserCreatePinCompleteRequest) (*pb.GoPayUserCreatePinCompleteResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserCreatePinCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -46,7 +46,7 @@ func (s *Server) GoPayUserCreatePinComplete(ctx context.Context, req *pb.GoPayUs
 	if strings.TrimSpace(req.GetPin()) == "" {
 		return &pb.GoPayUserCreatePinCompleteResponse{ErrorMessage: "pin is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserCreatePinCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -56,7 +56,7 @@ func (s *Server) GoPayUserCreatePinComplete(ctx context.Context, req *pb.GoPayUs
 		StateJson: stateJSON,
 	})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserCreatePinCompleteResponse{ErrorMessage: fmt.Sprintf("CreatePinComplete: %v", err)}, nil

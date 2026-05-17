@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Server) GoPayUserChangePhoneStart(ctx context.Context, req *pb.GoPayUserChangePhoneStartRequest) (*pb.GoPayUserChangePhoneStartResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserChangePhoneStartResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -18,7 +18,7 @@ func (s *Server) GoPayUserChangePhoneStart(ctx context.Context, req *pb.GoPayUse
 	if strings.TrimSpace(req.GetPin()) == "" {
 		return &pb.GoPayUserChangePhoneStartResponse{ErrorMessage: "pin is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserChangePhoneStartResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -28,7 +28,7 @@ func (s *Server) GoPayUserChangePhoneStart(ctx context.Context, req *pb.GoPayUse
 		StateJson: stateJSON,
 	})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserChangePhoneStartResponse{ErrorMessage: fmt.Sprintf("ChangePhoneStart: %v", err)}, nil
@@ -42,20 +42,20 @@ func (s *Server) GoPayUserChangePhoneStart(ctx context.Context, req *pb.GoPayUse
 }
 
 func (s *Server) GoPayUserChangePhoneComplete(ctx context.Context, req *pb.GoPayUserChangePhoneCompleteRequest) (*pb.GoPayUserChangePhoneCompleteResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserChangePhoneCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
 	if strings.TrimSpace(req.GetOtp()) == "" {
 		return &pb.GoPayUserChangePhoneCompleteResponse{ErrorMessage: "otp is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserChangePhoneCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
 	resp, err := s.gopayClient.ChangePhoneComplete(ctx, &pb.ChangePhoneCompleteRequest{Otp: req.GetOtp(), StateJson: stateJSON})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserChangePhoneCompleteResponse{ErrorMessage: fmt.Sprintf("ChangePhoneComplete: %v", err)}, nil
@@ -64,17 +64,17 @@ func (s *Server) GoPayUserChangePhoneComplete(ctx context.Context, req *pb.GoPay
 }
 
 func (s *Server) GoPayUserChangePhoneRetry(ctx context.Context, req *pb.GoPayUserChangePhoneRetryRequest) (*pb.GoPayUserChangePhoneRetryResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserChangePhoneRetryResponse{ErrorMessage: err.Error()}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserChangePhoneRetryResponse{ErrorMessage: err.Error()}, nil
 	}
 	resp, err := s.gopayClient.ChangePhoneRetry(ctx, &pb.ChangePhoneRetryRequest{StateJson: stateJSON})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserChangePhoneRetryResponse{ErrorMessage: fmt.Sprintf("ChangePhoneRetry: %v", err)}, nil

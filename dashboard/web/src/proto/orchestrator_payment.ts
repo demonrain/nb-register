@@ -69,7 +69,7 @@ export interface GoPayActivityInput {
   gopay_phone: string;
   sms_activation_id: string;
   /** WA 接码来源；local 或 tg:<user_id> */
-  state_key: string;
+  user_id: string;
 }
 
 export interface GoPayActivityOutput {

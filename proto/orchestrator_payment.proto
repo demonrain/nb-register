@@ -71,7 +71,7 @@ message GoPayActivityInput {
   string prepared_flow_id = 11;
   string gopay_phone = 12;
   string sms_activation_id = 13;
-  string state_key = 14; // WA 接码来源；local 或 tg:<user_id>
+  string user_id = 14; // WA 接码来源；local 或 tg:<user_id>
 }
 
 message GoPayActivityOutput {

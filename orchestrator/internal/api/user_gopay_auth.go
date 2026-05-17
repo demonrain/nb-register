@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Server) GoPayUserAuthStart(ctx context.Context, req *pb.GoPayUserAuthStartRequest) (*pb.GoPayUserAuthStartResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserAuthStartResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -19,7 +19,7 @@ func (s *Server) GoPayUserAuthStart(ctx context.Context, req *pb.GoPayUserAuthSt
 	if strings.TrimSpace(req.GetPin()) == "" {
 		return &pb.GoPayUserAuthStartResponse{ErrorMessage: "pin is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserAuthStartResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -31,7 +31,7 @@ func (s *Server) GoPayUserAuthStart(ctx context.Context, req *pb.GoPayUserAuthSt
 		StateJson:   stateJSON,
 	})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserAuthStartResponse{ErrorMessage: fmt.Sprintf("LoginStart: %v", err)}, nil
@@ -62,7 +62,7 @@ func (s *Server) GoPayUserAuthStart(ctx context.Context, req *pb.GoPayUserAuthSt
 }
 
 func (s *Server) GoPayUserAuthComplete(ctx context.Context, req *pb.GoPayUserAuthCompleteRequest) (*pb.GoPayUserAuthCompleteResponse, error) {
-	stateKey, err := normalizeGoPayUserStateKey(req.GetStateKey())
+	stateKey, err := normalizeGoPayUserID(req.GetUserId())
 	if err != nil {
 		return &pb.GoPayUserAuthCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
@@ -72,13 +72,13 @@ func (s *Server) GoPayUserAuthComplete(ctx context.Context, req *pb.GoPayUserAut
 	if strings.TrimSpace(req.GetPin()) == "" {
 		return &pb.GoPayUserAuthCompleteResponse{ErrorMessage: "pin is required"}, nil
 	}
-	stateJSON, err := s.loadGoPayAppStateForKey(ctx, stateKey)
+	stateJSON, err := s.loadGoPayAppStateForUser(ctx, stateKey)
 	if err != nil {
 		return &pb.GoPayUserAuthCompleteResponse{ErrorMessage: err.Error()}, nil
 	}
 	resp, err := s.gopayClient.LoginComplete(ctx, &pb.LoginCompleteRequest{Otp: req.GetOtp(), StateJson: stateJSON})
 	if err == nil {
-		err = s.saveGoPayAppStateForKey(ctx, stateKey, resp.GetStateJson())
+		err = s.saveGoPayAppStateForUser(ctx, stateKey, resp.GetStateJson())
 	}
 	if err != nil {
 		return &pb.GoPayUserAuthCompleteResponse{ErrorMessage: fmt.Sprintf("LoginComplete: %v", err)}, nil

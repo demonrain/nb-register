@@ -93,7 +93,7 @@ def _normalize_state_key(value: str) -> str:
         user_id = value.removeprefix("tg:").strip()
         if user_id and user_id.isdigit():
             return f"tg:{user_id}"
-    raise ValueError("state_key must be local or tg:<user_id>")
+    raise ValueError("user_id must be local or tg:<user_id>")
 
 
 class PostgresStateStore:
@@ -547,11 +547,11 @@ class GopayAppServicer(gopay_app_pb2_grpc.GopayAppServiceServicer):
 
     def GetGoPayState(self, request, context):
         try:
-            state_key = _normalize_state_key(request.state_key)
+            state_key = _normalize_state_key(request.user_id)
             state_json = _state_store().load(state_key)
             return gopay_app_pb2.GetGoPayStateResponse(
                 success=True,
-                state_key=state_key,
+                user_id=state_key,
                 state_json=state_json or "{}",
             )
         except Exception as e:
@@ -559,11 +559,11 @@ class GopayAppServicer(gopay_app_pb2_grpc.GopayAppServiceServicer):
 
     def UpsertGoPayState(self, request, context):
         try:
-            state_key = _normalize_state_key(request.state_key)
+            state_key = _normalize_state_key(request.user_id)
             state_json = _state_store().save(state_key, request.state_json or "{}")
             return gopay_app_pb2.UpsertGoPayStateResponse(
                 success=True,
-                state_key=state_key,
+                user_id=state_key,
                 state_json=state_json,
             )
         except Exception as e:
@@ -571,7 +571,7 @@ class GopayAppServicer(gopay_app_pb2_grpc.GopayAppServiceServicer):
 
     def DeleteGoPayState(self, request, context):
         try:
-            state_key = _normalize_state_key(request.state_key)
+            state_key = _normalize_state_key(request.user_id)
             _state_store().delete(state_key)
             return gopay_app_pb2.DeleteGoPayStateResponse(success=True)
         except Exception as e:
